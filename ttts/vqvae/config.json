@@ -1,6 +1,6 @@
 {
   "train": {
-    "gpu_numbers":"5,7",
+    "gpu_numbers":"5,6,7",
     "train_steps":1000000,
     "log_interval" : 100,
     "save_freq" : 1000,
@@ -9,9 +9,9 @@
     "betas": [ 0.8, 0.99 ],
     "eps": 1e-09,
     "segment_size": 20480,
-    "exp_dir":"ttts/vqvae/logs",
-    "ckpt_dir":"ttts/vqvae/logs",
-    "logs_folder":"ttts/vqvae/logs",
+    "exp_dir":"ttts/vqvae/logs/v2",
+    "ckpt_dir":"ttts/vqvae/logs/v2",
+    "logs_folder":"ttts/vqvae/logs/v2",
     "seed": 1234,
     "save_every_epoch":1,
     "if_save_every_weights":false,
@@ -88,6 +88,6 @@
     "use_spectral_norm": false,
     "gin_channels": 512,
     "semantic_frame_rate": "25hz",
-    "freeze_quantizer": false
+    "vq":true
   }
 }

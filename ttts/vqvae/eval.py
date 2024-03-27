@@ -7,7 +7,7 @@ from ttts.utils.data_utils import spec_to_mel_torch, mel_spectrogram_torch, HPar
 from ttts.vqvae.vq2 import SynthesizerTrn
 from pypinyin import Style, lazy_pinyin
 import torch
-device = 'cuda:1'
+device = 'cuda:6'
 hps_path='ttts/vqvae/config.json'
 hps = HParams(**json.load(open(hps_path)))
 net_g = SynthesizerTrn(

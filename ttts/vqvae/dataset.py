@@ -43,7 +43,7 @@ class VQGANDataset(torch.utils.data.Dataset):
         for path,text in zip(self.paths,self.texts):
             size = os.path.getsize(path)
             duration = size / self.sampling_rate / 2
-            if duration <54 and duration > 0.65:
+            if duration < 20 and duration > 0.65:
                 filtered_paths.append(path)
                 filtered_texts.append(text)
                 lengths.append(size // (2 * self.hop_length))

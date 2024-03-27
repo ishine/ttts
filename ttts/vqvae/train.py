@@ -86,7 +86,7 @@ def sample_like(signal: torch.Tensor) -> List[torch.Tensor]:
     g_min, g_max = hps.train.g_min, hps.train.g_max
     gain = torch.rand(bsize, peaks + 2, device=signal.device) * (g_max - g_min) + g_min
     return fs, ps, pr, power, gain
-def augment(signal, aug, ps: bool = False) -> torch.Tensor:
+def augment(signal, aug, ps: bool = True) -> torch.Tensor:
         """Augment the speech.
         Args:
             signal: [torch.float32; [B, T]], segmented speech.
@@ -332,10 +332,10 @@ def train_and_evaluate(
                 hps.data.hop_length, hps.data.win_length, center=False).squeeze(0)
             spec_lengths = torch.LongTensor([
                 x//hps.data.hop_length for x in wav_lengths]).cuda(rank, non_blocking=True)
-            if hps.vqvae.freeze_quantizer == True:
-                wav_aug = wav
-            else:
+            if hps.vqvae.vq == False:
                 wav_aug = augment(wav, aug)
+            else:
+                wav_aug = wav
             spec_aug = spectrogram_torch(wav_aug, hps.data.filter_length,
                 hps.data.hop_length,
                 hps.data.win_length, center=False).squeeze(0)
@@ -393,10 +393,12 @@ def train_and_evaluate(
             with autocast(enabled=False):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
-
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                loss_gen_all = loss_gen + loss_fm + loss_mel + kl_ssl * 1 + loss_kl
+                if hps.vqvae.vq == False:
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
+                else:
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + kl_ssl * 1 + loss_kl
 
         optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
@@ -408,7 +410,10 @@ def train_and_evaluate(
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
                 lr = optim_g.param_groups[0]["lr"]
-                losses = [loss_disc, loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl]
+                if hps.vqvae.vq == False:
+                    losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_kl]
+                else:
+                    losses = [loss_disc, loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl]
                 logger.info(
                     "Train Epoch: {} [{:.0f}%]".format(
                         epoch, 100.0 * batch_idx / len(train_loader)
@@ -456,6 +461,7 @@ def train_and_evaluate(
                     images=image_dict,
                     audios=audios_dict,
                     scalars=scalar_dict,
+                    audio_sampling_rate=32000
                 )
         global_step += 1
     if epoch % hps.train.save_every_epoch == 0 and rank == 0:

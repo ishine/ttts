@@ -772,7 +772,7 @@ class SynthesizerTrn(nn.Module):
         n_speakers=0,
         gin_channels=0,
         semantic_frame_rate=None,
-        freeze_quantizer=None,
+        vq=None,
         **kwargs
     ):
         super().__init__()
@@ -834,9 +834,9 @@ class SynthesizerTrn(nn.Module):
         )
         self.quantizer = ResidualVectorQuantizer(dimension=inter_channels, n_q=1, bins=1024)
         self.proj = nn.Conv1d(inter_channels, inter_channels, 2, stride=2)
-        if freeze_quantizer:
-            # self.proj.requires_grad_(False)
-            # self.quantizer.requires_grad_(False)
+        self.vq = vq
+        if self.vq:
+            self.proj.requires_grad_(False)
             self.enc_p.requires_grad_(False)
 
     def forward(self, wav, wav_aug, wav_lengths, y, y_aug, y_lengths, text, text_lengths):
@@ -845,11 +845,15 @@ class SynthesizerTrn(nn.Module):
         )
         ge = self.ref_enc(y * y_mask, y_mask)
 
-        x, _, _ = self.enc_p(y_aug, wav_aug.unsqueeze(1), y_mask, g=ge)
+        x, m_p, logs_p = self.enc_p(y_aug, wav_aug.unsqueeze(1), y_mask)
         
         x = self.proj(x)
-        quantized, codes,\
-        commit_loss, quantized_list = self.quantizer(x, layers=[0])
+        if self.vq:
+            quantized, codes,\
+            commit_loss, quantized_list = self.quantizer(x, layers=[0])
+        else:
+            commit_loss = 0
+            quantized = x
         quantized = F.interpolate(
             quantized, size=int(quantized.shape[-1] * 2), mode="nearest"
         )
@@ -876,10 +880,13 @@ class SynthesizerTrn(nn.Module):
         )
         ge = self.ref_enc(y * y_mask, y_mask)
 
-        x, _, _ = self.enc_p(y, wav.unsqueeze(1), y_mask, g=ge)
+        x, _, _ = self.enc_p(y, wav.unsqueeze(1), y_mask)
         x = self.proj(x)
-        quantized, codes,\
-        commit_loss, quantized_list = self.quantizer(x, layers=[0])
+        if self.vq:
+            quantized, codes,\
+            commit_loss, quantized_list = self.quantizer(x, layers=[0])
+        else:
+            quantized = x
         quantized = F.interpolate(
             quantized, size=int(quantized.shape[-1] * 2), mode="nearest"
         )
@@ -914,7 +921,7 @@ class SynthesizerTrn(nn.Module):
             y.dtype
         )
         ge = self.ref_enc(y * y_mask, y_mask)
-        x, _, _ = self.enc_p(y, wav.unsqueeze(1), y_mask, g=ge)
+        x, _, _ = self.enc_p(y, wav.unsqueeze(1), y_mask)
         x = self.proj(x*y_mask)*y_mask
         quantized, codes, commit_loss, quantized_list = self.quantizer(x)
         return codes.transpose(0, 1)
