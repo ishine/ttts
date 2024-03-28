@@ -165,7 +165,7 @@ def run(rank, n_gpus, hps):
     collate_fn = VQVAECollater()
     train_loader = DataLoader(
         train_dataset,
-        num_workers=1,
+        num_workers=16,
         shuffle=False,
         pin_memory=True,
         collate_fn=collate_fn,
@@ -185,9 +185,9 @@ def run(rank, n_gpus, hps):
     aug = Augment(hps).cuda(rank)
 
     net_d = MultiPeriodDiscriminator().cuda(rank) if torch.cuda.is_available() else MultiPeriodDiscriminator().to(device)
-    for name, param in net_g.named_parameters():
-        if not param.requires_grad:
-            print(name, "not requires_grad")
+    # for name, param in net_g.named_parameters():
+    #     if not param.requires_grad:
+    #         print(name, "not requires_grad")
     print("net_g:", count_parameters(net_g))
     print("net_d:", count_parameters(net_d))
     optim_g = torch.optim.AdamW(

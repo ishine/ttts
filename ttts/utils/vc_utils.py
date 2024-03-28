@@ -262,6 +262,8 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False
         try:
             # assert "dec" in k or "disc" in k
             # print("load", k)
+            # if 'quantizer' in k:
+            #   continue
             new_state_dict[k] = saved_state_dict[k]
             assert saved_state_dict[k].shape == v.shape, (saved_state_dict[k].shape, v.shape)
         except:
@@ -269,9 +271,9 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False
             logger.info("%s is not in the checkpoint" % k)
             new_state_dict[k] = v
     if hasattr(model, 'module'):
-        model.module.load_state_dict(new_state_dict)
+        model.module.load_state_dict(new_state_dict,strict=False)
     else:
-        model.load_state_dict(new_state_dict)
+        model.load_state_dict(new_state_dict,strict=False)
     print("load ")
     logger.info("Loaded checkpoint '{}' (iteration {})".format(
         checkpoint_path, iteration))

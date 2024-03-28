@@ -773,6 +773,7 @@ class SynthesizerTrn(nn.Module):
         gin_channels=0,
         semantic_frame_rate=None,
         vq=None,
+        vq2=None,
         **kwargs
     ):
         super().__init__()
@@ -832,12 +833,15 @@ class SynthesizerTrn(nn.Module):
         self.ref_enc = modules.MelStyleEncoder(
             spec_channels, style_vector_dim=gin_channels
         )
-        self.quantizer = ResidualVectorQuantizer(dimension=inter_channels, n_q=1, bins=1024)
+        self.quantizer = ResidualVectorQuantizer(dimension=inter_channels, n_q=1, bins=4096)
         self.proj = nn.Conv1d(inter_channels, inter_channels, 2, stride=2)
         self.vq = vq
+        self.vq2 = vq2
         if self.vq:
             self.proj.requires_grad_(False)
             self.enc_p.requires_grad_(False)
+        if self.vq2:
+            self.quantizer.requires_grad_(False)
 
     def forward(self, wav, wav_aug, wav_lengths, y, y_aug, y_lengths, text, text_lengths):
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(
@@ -921,7 +925,9 @@ class SynthesizerTrn(nn.Module):
             y.dtype
         )
         ge = self.ref_enc(y * y_mask, y_mask)
-        x, _, _ = self.enc_p(y, wav.unsqueeze(1), y_mask)
+
+        x, _, _ = self.enc_p(y_aug, wav.unsqueeze(1), y_mask)
+        
         x = self.proj(x*y_mask)*y_mask
         quantized, codes, commit_loss, quantized_list = self.quantizer(x)
         return codes.transpose(0, 1)
