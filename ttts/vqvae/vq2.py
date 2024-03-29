@@ -920,14 +920,15 @@ class SynthesizerTrn(nn.Module):
         o = self.dec((z * y_mask)[:, :, :], g=ge)
         return o
 
-    def extract_latent(self, wav, y):
-        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(
+    def extract_code(self, wav, y):
+        y_length = torch.LongTensor([y.size(2)]).to(y.device)
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_length, y.size(2)), 1).to(
             y.dtype
         )
         ge = self.ref_enc(y * y_mask, y_mask)
 
-        x, _, _ = self.enc_p(y_aug, wav.unsqueeze(1), y_mask)
+        x, _, _ = self.enc_p(y, wav.unsqueeze(1), y_mask)
         
-        x = self.proj(x*y_mask)*y_mask
+        x = self.proj(x*y_mask)
         quantized, codes, commit_loss, quantized_list = self.quantizer(x)
         return codes.transpose(0, 1)
