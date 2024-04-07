@@ -21,9 +21,17 @@ Use the following instruction to train the model.
 ```
 python ttts/vqvae/train.py
 ```
+There are three stages for vqvae training, and this is important for the vqgan to converge.
+- stage1: Use data augmentation and continuous latent feature to train the timbre disentangle module. vq and vq2 in `config.json` are all set to false.
+- stage2: Add vq to the model and freeze the timbre remove module. vq is set to True, vq2 is set to False.
+- stage3: Freeze vq and timbre remover, train the decoder part only. vq and vq2 are all set to True.
 
 ### 3. GPT training
-Use `2_save_vq_to_disk.py` to preprocess vq. Run
+Use `2_save_vq_to_disk.py` to preprocess vq. 
+
+It's important to concat long enough samples for training, so you need to check the `dataset.py` to make true the same speaker audio can be recognized.
+
+Run
 ```
 accelerate launch ttts/gpt/train.py
 ```

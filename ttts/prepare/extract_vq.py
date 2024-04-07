@@ -7,9 +7,14 @@ from tqdm import tqdm
 import os
 import json
 from ttts.utils.data_utils import spectrogram_torch,HParams
+import random
 
-model_path = '/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v2/G_113085.pth'
-vqvae = load_model('vqvae', model_path, 'ttts/vqvae/config.json', 'cuda')
+model_path = '/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v2/G_128163.pth'
+# device_ids = [4,5,6,7]
+# rank = random.choice(device_ids)
+# device = f'cuda:{rank}'
+device = 'cuda'
+vqvae = load_model('vqvae', model_path, 'ttts/vqvae/config.json', device)
 hps = HParams(**json.load(open('ttts/vqvae/config.json')))
 def process_vq(path):
     wav_path = path
@@ -17,7 +22,7 @@ def process_vq(path):
         wav,sr = torchaudio.load(wav_path)
         if wav.shape[0] > 1:
             wav = wav[0].unsqueeze(0)
-        wav = wav.cuda()
+        wav = wav.to(device)
         wav32k = F.resample(wav, sr, 32000)
         wav32k = wav32k[:,:int(hps.data.hop_length * 2 * (wav32k.shape[-1]//hps.data.hop_length//2))]
         wav = torch.clamp(wav32k, min=-1.0, max=1.0)

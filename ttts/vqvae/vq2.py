@@ -909,10 +909,11 @@ class SynthesizerTrn(nn.Module):
             commons.sequence_mask(refer_lengths, refer.size(2)), 1
         ).to(refer.dtype)
         ge = self.ref_enc(refer * refer_mask, refer_mask)
-        y_lengths = torch.LongTensor([codes.size(2)]).to(codes.device)
         quantized = self.quantizer.decode(codes)
         quantized = F.interpolate(quantized, size=int(quantized.shape[-1] * 2), mode="nearest")
-        x, m_p, logs_p = self.enc_p_2(quantized, y_lengths, text, text_legnths, ge)
+        y_lengths = torch.LongTensor([quantized.size(2)]).to(quantized.device)
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, quantized.size(2)), 1).to(quantized.dtype)
+        x, m_p, logs_p = self.enc_p_2(quantized, y_lengths, text, text_lengths, ge)
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
 
         z = self.flow(z_p, y_mask, g=ge, reverse=True)

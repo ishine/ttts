@@ -133,6 +133,11 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         if input_ids.shape[1] != 1:
             text_inputs = input_ids[:, mel_len:]
             text_emb = self.embeddings(text_inputs)
+            # text_pos_emb = self.text_pos_embedding(text_inputs)
+            # text_pos_emb = text_pos_emb.unsqueeze(0).transpose(1,2)
+            # text_pos_emb = F.interpolate(text_pos_emb,
+            #     size=int(text_pos_emb.shape[-1] * 2), mode="nearest")[:,:,:int(text_pos_emb.shape[-1])]
+            # text_emb = text_emb + text_pos_emb.transpose(1,2).squeeze(0)
             text_emb = text_emb + self.text_pos_embedding(text_emb)
             if self.cached_mel_emb.shape[0] != text_emb.shape[0]:
                 mel_emb = self.cached_mel_emb.repeat_interleave(
@@ -291,7 +296,7 @@ class MelEncoder(nn.Module):
 
 class UnifiedVoice(nn.Module):
     def __init__(self, layers=8, model_dim=512, heads=8, max_text_tokens=120, max_mel_tokens=250, max_conditioning_inputs=1,
-                 mel_length_compression=1024, number_text_tokens=256,
+                 mel_length_compression=1280, number_text_tokens=256,
                  start_text_token=None, number_mel_codes=8194, start_mel_token=8192,
                  stop_mel_token=8193, train_solo_embeddings=False, use_mel_codes_as_input=True,
                  checkpointing=True, types=1):
@@ -535,6 +540,11 @@ class UnifiedVoice(nn.Module):
 
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
+        # text_pos_emb = self.text_pos_embedding(text_inputs)
+        # text_pos_emb = text_pos_emb.unsqueeze(0).transpose(1,2)
+        # text_pos_emb = F.interpolate(text_pos_emb,
+        #     size=int(text_pos_emb.shape[-1] * 2), mode="nearest")[:,:,:int(text_pos_emb.shape[-1])]
+        # text_emb = self.text_embedding(text_inputs) + text_pos_emb.transpose(1,2).squeeze(0)
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
         mel_codes, _ = self.build_aligned_inputs_and_targets(mel_codes, self.start_mel_token, self.stop_mel_token)
 

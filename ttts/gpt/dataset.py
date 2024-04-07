@@ -12,6 +12,7 @@ from pypinyin import Style, lazy_pinyin
 from ttts.gpt.voice_tokenizer import VoiceBpeTokenizer
 import json
 import os
+from pathlib import Path
 
 def read_jsonl(path):
     with open(path, 'r') as f:
@@ -32,31 +33,85 @@ class GptTtsDataset(torch.utils.data.Dataset):
         self.tok = VoiceBpeTokenizer('ttts/gpt/gpt_tts_tokenizer.json')
         self.jsonl_path = opt['dataset']['path']
         self.audiopaths_and_text = read_jsonl(self.jsonl_path)
-
+        self.audiopaths_and_text = sorted(self.audiopaths_and_text,
+                key=lambda x: x['path'])
+    def get_text_and_vq(self, audiopath_and_text):
+        audiopath, text = audiopath_and_text['path'], audiopath_and_text['text']
+        text = ' '.join(lazy_pinyin(text, style=Style.TONE3, neutral_tone_with_five=True))
+        text = self.tok.encode(text)
+        text = LongTensor(text)
+        # Fetch quantized MELs
+        quant_path = audiopath + '.vq.pth'
+        vq = LongTensor(torch.load(quant_path))
+        return text, vq
+    def get_wav_len(self, path):
+        wav,sr = torchaudio.load(audiopath)
+        wav = torchaudio.functional.resample(wav, sr, 32000)
+        wav_length = wav.shape[-1]
+        return wav_length
+    def is_same_spk(self, path1, path2):
+        name1 = Path(path1).parent.name
+        name2 = Path(path2).parent.name
+        if name1[:3]=='SSB' and name2[:3]=='SSB':
+            if name1[:7]==name2[:7]:
+                return True
+        if name1[:2]=='vo' and name2[:2]=='vo':
+            if name1.split('_')[-2] == name2.split('_')[-2] or \
+            name1.split('_')[-3] == name2.split('_')[-3]:
+                return True
+        return False
     def __getitem__(self, index):
         try:
             # Fetch text and add start/stop tokens.
             audiopath_and_text = self.audiopaths_and_text[index]
-            audiopath, text = audiopath_and_text['path'], audiopath_and_text['text']
-            text = ' '.join(lazy_pinyin(text, style=Style.TONE3, neutral_tone_with_five=True))
-            text = self.tok.encode(text)
-            text = LongTensor(text)
-
-            # Fetch quantized MELs
-            quant_path = audiopath + '.vq.pth'
-            qmel = LongTensor(torch.load(quant_path))
-
+            text, vq = self.get_text_and_vq(audiopath_and_text)
+            vq = vq[1:-1]
+            pths = self.audiopaths_and_text
+            l = self.__len__()
+            text_prepre, vq_prepre, prepre_wav_len = None,None,None
+            text_postpost, vq_postpost, postpost_wav_len = None,None,None
+            text_pre, vq_pre, pre_wav_len = None, None, None
+            text_post, vq_post, post_wav_len = None, None, None
+            prepre_ind = random.randint(2, 9)
+            if self.is_same_spk(pths[(index-prepre_ind+l)%l]['path'], audiopath_and_text['path']):
+                text_prepre, vq_prepre = self.get_text_and_vq(pths[(index-prepre_ind+l)%l])
+                vq_prepre = vq_prepre[1:-1]
+                prepre_wav_len = vq_prepre.shape[-1]*1280
+            if self.is_same_spk(pths[(index-1+l)%l]['path'], audiopath_and_text['path']):
+                text_pre, vq_pre = self.get_text_and_vq(pths[(index-1+l)%l])
+                vq_pre = vq_pre[1:-1]
+                pre_wav_len = vq_pre.shape[-1]*1280
+            if self.is_same_spk(pths[(index+1+l)%l]['path'], audiopath_and_text['path']):
+                text_post, vq_post = self.get_text_and_vq(pths[(index+1+l)%l])
+                vq_post = vq_post[1:-1]
+                post_wav_len = vq_post.shape[-1]*1280
+            postpost_ind = random.randint(2, 9)
+            if self.is_same_spk(pths[(index+postpost_ind+l)%l]['path'], audiopath_and_text['path']):
+                text_postpost, vq_postpost = self.get_text_and_vq(pths[(index+postpost_ind+l)%l])
+                vq_postpost = vq_postpost[1:-1]
+                postpost_wav_len = vq_postpost.shape[-1]*1280
+            wav_length = vq.shape[-1]*1280
+            if text_pre is not None:
+                text = torch.cat((text_pre,text))
+                vq = torch.cat((vq_pre, vq))
+                wav_length = wav_length + pre_wav_len
+            if text_prepre is not None:
+                text = torch.cat((text_prepre,text))
+                vq = torch.cat((vq_prepre, vq))
+                wav_length = wav_length + prepre_wav_len
+            if text_post is not None:
+                text = torch.cat((text,text_post))
+                vq = torch.cat((vq, vq_post))
+                wav_length = wav_length + post_wav_len
+            if text_postpost is not None:
+                text = torch.cat((text,text_postpost))
+                vq = torch.cat((vq, vq_postpost))
+                wav_length = wav_length + postpost_wav_len
         except Exception as e:
             print(e)
             return None
-        #load wav
-        wav,sr = torchaudio.load(audiopath)
-        wav = torchaudio.functional.resample(wav, sr, 24000)
-        wav_length = wav.shape[-1]
-        if text.shape[0]>400 or qmel.shape[0]>600:
-            return None
-
-        return text, qmel, wav_length
+        # load wav
+        return text, vq, wav_length
 
     def __len__(self):
         return len(self.audiopaths_and_text)
@@ -71,9 +126,9 @@ class GptTtsCollater():
         if len(batch)==0:
             return None
         text_lens = [len(x[0]) for x in batch]
-        max_text_len = max(text_lens)
+        max_text_len = max(text_lens)+1
         qmel_lens = [len(x[1]) for x in batch]
-        max_qmel_len = max(qmel_lens)
+        max_qmel_len = max(qmel_lens)+1
         wav_lens = [x[2] for x in batch]
         max_wav_len = max(wav_lens)
         texts = []

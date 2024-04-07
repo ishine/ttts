@@ -37,5 +37,5 @@ spec = spectrogram_torch(wav32k, hps.data.filter_length,
 spec_length = torch.LongTensor([
                 x//hps.data.hop_length for x in wav_length]).to(device)
 with torch.no_grad():
-    wav_recon = model.infer(wav32k, wav_length, spec.unsqueeze(0), spec_length, text, text_length, noise_scale=0.5)
+    wav_recon = model.infer(wav32k, wav_length, spec.unsqueeze(0), spec_length, text, text_length, noise_scale=0.4)
 torchaudio.save('gen.wav', wav_recon[0].detach().cpu(), 32000)
