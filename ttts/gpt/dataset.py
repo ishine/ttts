@@ -55,9 +55,12 @@ class GptTtsDataset(torch.utils.data.Dataset):
         if name1[:3]=='SSB' and name2[:3]=='SSB':
             if name1[:7]==name2[:7]:
                 return True
-        if name1[:2]=='vo' and name2[:2]=='vo':
+        elif name1[:2]=='vo' and name2[:2]=='vo':
             if name1.split('_')[-2] == name2.split('_')[-2] or \
             name1.split('_')[-3] == name2.split('_')[-3]:
+                return True
+        else:
+            if name1 == name2:
                 return True
         return False
     def __getitem__(self, index):
@@ -110,6 +113,8 @@ class GptTtsDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(e)
             return None
+        if text.shape[-1]>=800 or vq.shape[-1]>=1600:
+            return None 
         # load wav
         return text, vq, wav_length
 

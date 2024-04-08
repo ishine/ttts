@@ -1,4 +1,5 @@
 import copy
+import torch.autograd.profiler as profiler
 import math
 import torch
 from torch import nn
@@ -844,6 +845,8 @@ class SynthesizerTrn(nn.Module):
             self.quantizer.requires_grad_(False)
 
     def forward(self, wav, wav_aug, wav_lengths, y, y_aug, y_lengths, text, text_lengths):
+        # with profiler.profile(with_stack=True, profile_memory=True) as prof:
+
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(
             y.dtype
         )
@@ -869,6 +872,7 @@ class SynthesizerTrn(nn.Module):
             z, y_lengths, self.segment_size
         )
         o = self.dec(z_slice, g=ge)
+        # print(prof.key_averages(group_by_stack_n=5).table(sort_by='self_cpu_time_total', row_limit=5))
         return (
             o,
             commit_loss,

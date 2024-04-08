@@ -5,8 +5,8 @@ import numpy as np
 from ttts.utils import vc_utils
 
 MODELS = {
-    'vqvae.pth':'/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v2/G_214814.pth',
-    'gpt.pth': '/home/hyc/tortoise_plus_zh/ttts/gpt/logs/2024-04-06-17-01-14/model-240.pt',
+    'vqvae.pth':'/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v2/G_237426.pth',
+    'gpt.pth': '/home/hyc/tortoise_plus_zh/ttts/gpt/logs/2024-04-08-05-10-16/model-340.pt',
     'clvp2.pth': '',
     'diffusion.pth': '',
     'vocoder.pth': '',
@@ -18,7 +18,7 @@ import torch.nn.functional as F
 cond_audio = 'ttts/7.wav'
 # cond_text = "霞浦县衙城镇乌旗，瓦窑村水位猛涨。"
 # cond_text = "现场都是人，五辆警车好不容易找到位置停下。"
-# cond_text = "嗨，现在是小事，只是向你打听一个地方。"
+# cond_text = "嘿，现在是小事儿，只是向你打听一个地方。"
 # cond_text = "除了曾经让全人类都畏惧的麻疹和天花之外。"
 # cond_text = "开始步行导航，今天我也是没有迟到哦。"
 # cond_text = "这是县交警队的一个小据点。"

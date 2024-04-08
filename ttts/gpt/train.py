@@ -141,5 +141,5 @@ class Trainer(object):
 
 if __name__ == '__main__':
     trainer = Trainer()
-    trainer.load('/home/hyc/tortoise_plus_zh/ttts/gpt/logs/2024-04-06-17-01-14/model-242.pt')
+    trainer.load('/home/hyc/tortoise_plus_zh/ttts/gpt/logs/2024-04-07-18-57-39/model-322.pt')
     trainer.train()

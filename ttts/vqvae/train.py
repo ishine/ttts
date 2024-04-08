@@ -1,8 +1,10 @@
 from ttts.utils import vc_utils as utils
 import os, json
+import time
 from ttts.utils.data_utils import spec_to_mel_torch, mel_spectrogram_torch, HParams, spectrogram_torch
 hps_path='ttts/vqvae/config.json'
 hps = HParams(**json.load(open(hps_path)))
+import torch.autograd.profiler as profiler
 os.environ["CUDA_VISIBLE_DEVICES"] = hps.train.gpu_numbers
 import torch
 from torch.nn import functional as F
@@ -165,7 +167,7 @@ def run(rank, n_gpus, hps):
     collate_fn = VQVAECollater()
     train_loader = DataLoader(
         train_dataset,
-        num_workers=16,
+        num_workers=hps.dataloader.num_workers,
         shuffle=False,
         pin_memory=True,
         collate_fn=collate_fn,
