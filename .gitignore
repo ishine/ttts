@@ -13,5 +13,5 @@ damo/*
 .cache/*
 */**/*.wav
 */**/*.mp3
+!ttts/*.wav
 ast_indexer
-!3.wav
