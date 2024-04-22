@@ -1,4 +1,5 @@
 import json
+import random
 import os
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from ttts.gpt.voice_tokenizer import VoiceBpeTokenizer
 import wave
 import logging
 import subprocess
+from glob import glob
 numba_logger = logging.getLogger('numba')
 numba_logger.setLevel(logging.ERROR)
 
@@ -32,25 +34,26 @@ class VQGANDataset(torch.utils.data.Dataset):
     def __init__(self, hps):
         paths = read_jsonl(hps.dataset.path)
         pre = os.path.expanduser(hps.dataset.pre)
+        # self.paths = glob(os.path.join(hps.dataset.path, "**/*.wav"), recursive=True)
         self.paths = [os.path.join(pre,d['path']) for d in paths]
         self.texts = [d['text'] for d in paths]
         self.hop_length = hps.data.hop_length
         self.win_length = hps.data.win_length
         self.sampling_rate = hps.data.sampling_rate
-        lengths = []
+        # lengths = [len(x) for x in self.texts]
         filtered_paths = []
+        lengths=[]
         filtered_texts = []
         for path,text in zip(self.paths,self.texts):
             size = os.path.getsize(path)
             duration = size / self.sampling_rate / 2
             if duration < 20 and duration > 0.65:
                 filtered_paths.append(path)
-                filtered_texts.append(text)
                 lengths.append(size // (2 * self.hop_length))
+                filtered_texts.append(text)
+        self.tok = VoiceBpeTokenizer('ttts/gpt/gpt_tts_tokenizer.json')
         self.paths = filtered_paths
         self.texts = filtered_texts
-        self.filter_length = hps.data.filter_length
-        self.tok = VoiceBpeTokenizer('ttts/gpt/gpt_tts_tokenizer.json')
         self.lengths = lengths
 
     def __getitem__(self, index):
@@ -64,11 +67,9 @@ class VQGANDataset(torch.utils.data.Dataset):
         if wav.shape[0] > 1:
             wav = wav[0].unsqueeze(0)
         wav32k = AuF.resample(wav, sr, 32000)
-        if wav32k.shape[-1]<16*self.hop_length:
-            print(wav_path)
-            return None
-        wav32k = wav32k[:,:int(self.hop_length * 2 * (wav32k.shape[-1]//self.hop_length//2))]
+        wav32k = wav32k[:,:int(self.hop_length * 4 * (wav32k.shape[-1]//self.hop_length//4))]
         wav32k = torch.clamp(wav32k, min=-1.0, max=1.0)
+        # text = torch.Tensor([0])
         return  wav32k, text
 
     def __len__(self):

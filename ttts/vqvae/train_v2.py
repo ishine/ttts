@@ -1,6 +1,8 @@
 from ttts.utils import vc_utils as utils
+import random
 import os, json
 import time
+import torchaudio
 from ttts.utils.data_utils import spec_to_mel_torch, mel_spectrogram_torch, HParams, spectrogram_torch
 hps_path='ttts/vqvae/config.json'
 hps = HParams(**json.load(open(hps_path)))
@@ -26,7 +28,7 @@ from random import randint
 from ttts.utils import commons
 
 from ttts.vqvae.dataset import VQGANDataset, VQVAECollater, DistributedBucketSampler
-from ttts.vqvae.vq2 import SynthesizerTrn, MultiPeriodDiscriminator
+from ttts.vqvae.vq3 import SynthesizerTrn, MultiPeriodDiscriminator
 from ttts.vqvae.losses import generator_loss, discriminator_loss, feature_loss, kl_loss
 from ttts.vqvae.process_ckpt import savee
 
@@ -61,62 +63,59 @@ def main():
         ),
     )
 
-def sample_like(signal: torch.Tensor) -> List[torch.Tensor]:
-    """Sample augmentation parameters.
-    Args:
-        signal: [torch.float32; [B, T]], speech signal.
-    Returns:
-        augmentation parameters.
-    """
-    # [B]
-    bsize, _ = signal.shape
-    def sampler(ratio):
-        shifts = torch.rand(bsize, device=signal.device) * (ratio - 1.) + 1.
-        # flip
-        flip = torch.rand(bsize) < 0.5
-        shifts[flip] = shifts[flip] ** -1
-        return shifts
-    # sample shifts
-    fs = sampler(hps.train.formant_shift)
-    ps = sampler(hps.train.pitch_shift)
-    pr = sampler(hps.train.pitch_range)
-    # parametric equalizer
-    peaks = hps.train.num_peak
-    # quality factor
-    power = torch.rand(bsize, peaks + 2, device=signal.device)
-    # gains
-    g_min, g_max = hps.train.g_min, hps.train.g_max
-    gain = torch.rand(bsize, peaks + 2, device=signal.device) * (g_max - g_min) + g_min
-    return fs, ps, pr, power, gain
-def augment(signal, aug, ps: bool = True) -> torch.Tensor:
-        """Augment the speech.
-        Args:
-            signal: [torch.float32; [B, T]], segmented speech.
-            ps: whether use pitch shift.
-        Returns:
-            [torch.float32; [B, T]], speech signal.
-        """
-        # B
-        bsize, _ = signal.shape
-        saves = None
-        while saves is None or len(saves) < bsize:
-            # [B] x 4
-            fshift, pshift, prange, power, gain = sample_like(signal)
-            if not ps:
-                pshift = None
-            # [B, T]
-            out = aug.forward(signal, pshift, prange, fshift, power, gain)
-            # for covering unexpected NaN
-            nan = out.isnan().any(dim=-1)
-            if not nan.all():
-                # save the outputs for not-nan inputs
-                if saves is None:
-                    saves = out[~nan]
-                else:
-                    saves = torch.cat([saves, out[~nan]], dim=0)
-        # [B, T]
-        return saves[:bsize]
 
+def Perturbing(
+    audios: torch.FloatTensor,
+    sample_rate: int= 32000,
+    f0_perturbation_factor_min: int= -6,
+    f0_perturbation_factor_max: int= 6,
+    pes_low_cutoff: int= 60,
+    pes_high_cutoff: int= 10000,
+    pes_q_min: float= 2.0,
+    pes_q_max: float= 5.0,
+    gain_min: float= -12.0,
+    gain_max: float= 12.0,
+    ):
+    step = random.choice([-16,-15,-14,-13,-11,-8,-4,3,5,6,7,8,12,13])
+    try:
+        audios = torchaudio.functional.pitch_shift(
+            audios.unsqueeze(1),
+            sample_rate= sample_rate,
+            n_steps= step,
+            bins_per_octave=12,
+            ).squeeze(1)
+    except Exception as e:
+        print(step)
+        print(e)
+    with torch.cuda.amp.autocast(enabled= False):   # equalizer_biquad does not support fp16
+        audios = audios.float()
+        cutoff_frequency_hls = torch.tensor(min(pes_low_cutoff // 2, sample_rate // 2)).to(audios.device)
+        cutoff_frequency_hhs = torch.tensor(min(pes_high_cutoff // 2, sample_rate // 2)).to(audios.device) # when over sample_rate // 2, audio is broken.
+        num_peaking_filters = 8
+        frequencies_peak = torch.logspace(cutoff_frequency_hls.log10(), cutoff_frequency_hhs.log10(), num_peaking_filters + 2)[1:-1]
+
+        audios = torchaudio.functional.equalizer_biquad(
+            waveform= audios,
+            sample_rate= sample_rate,
+            center_freq= cutoff_frequency_hhs,
+            gain= 0.0
+            )
+        audios = torchaudio.functional.equalizer_biquad(
+            waveform= audios,
+            sample_rate= sample_rate,
+            center_freq= cutoff_frequency_hls,
+            gain= 0.0
+            )
+        for x in frequencies_peak:
+            audios = torchaudio.functional.equalizer_biquad(
+            waveform= audios,
+            sample_rate= sample_rate,
+            center_freq= x,
+            gain= (gain_max - gain_min) * torch.rand(1) + gain_min,
+            Q= pes_q_min * (pes_q_max - pes_q_min) ** torch.rand(1)
+            )
+
+    return audios
 
 def run(rank, n_gpus, hps):
     global global_step
@@ -315,29 +314,20 @@ def train_and_evaluate(
     for batch_idx, data in tqdm(enumerate(train_loader)):
         wav = data['wav']
         wav_lengths = data['wav_lengths']
-        text = data['text']
-        text_lengths = data['text_lengths']
         if torch.cuda.is_available():
             wav, wav_lengths = wav.cuda(rank, non_blocking=True), wav_lengths.cuda(
                 rank, non_blocking=True
             )
             y, y_lengths = wav, wav_lengths
-            text, text_lengths = text.cuda(rank, non_blocking=True), text_lengths.cuda(
-                rank, non_blocking=True
-            )
         else:
             wav, wav_lengths = wav.to(device), wav_lengths.to(device)
-            text, text_lengths = text.to(device), text_lengths.to(device)
 
         with autocast(enabled=hps.train.fp16_run):
             spec = spectrogram_torch(wav, hps.data.filter_length,
                 hps.data.hop_length, hps.data.win_length, center=False).squeeze(0)
             spec_lengths = torch.LongTensor([
                 x//hps.data.hop_length for x in wav_lengths]).cuda(rank, non_blocking=True)
-            if hps.vqvae.vq == False:
-                wav_aug = augment(wav, aug)
-            else:
-                wav_aug = wav
+            wav_aug = Perturbing(wav)
             spec_aug = spectrogram_torch(wav_aug, hps.data.filter_length,
                 hps.data.hop_length,
                 hps.data.win_length, center=False).squeeze(0)
@@ -348,7 +338,7 @@ def train_and_evaluate(
                 z_mask,
                 (z, z_p, m_p, logs_p, m_q, logs_q),
                 stats_ssl,
-            ) = net_g(wav, wav_aug, wav_lengths, spec, spec_aug, spec_lengths, text, text_lengths)
+            ) = net_g(spec, spec_aug, spec_lengths)
 
             mel = spec_to_mel_torch(
                 spec,

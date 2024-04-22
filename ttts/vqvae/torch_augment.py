@@ -55,13 +55,15 @@ class torch_augment(nn.Module):
         print(factor)
         return self.formant_shift(wav, factor)
 
-def pitch_shift_(wav, sample_rate):
-    wav_shift = pitch_shift(wav,sample_rate,-4)
+def pitch_shift_(wav, sample_rate, step):
+    wav_shift = pitch_shift(wav,sample_rate, step)
     return wav_shift
 wav, sr = torchaudio.load('ttts/0.wav')
 # augment = torch_augment(sr,1.5).to(device)
 wav = wav.to(device)
-t = time.time()
-wav_aug = pitch_shift_(wav,sr).cpu()
-print(time.time()-t)
-torchaudio.save('ttts/0_aug.wav', wav_aug, sr)
+for i in [-16,-15,-14,-13,-11,-9,-8,-7,-4,3,4,5,6,7,8,9,10,12,13]:
+    print(i)
+    t = time.time()
+    wav_aug = pitch_shift_(wav,sr,i).cpu()
+    print(time.time()-t)
+# torchaudio.save('ttts/0_aug.wav', wav_aug, sr)

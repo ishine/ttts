@@ -115,15 +115,6 @@ class TextEncoder(nn.Module):
         self.p_dropout = p_dropout
         self.latent_channels = latent_channels
 
-        self.encoder_ssl = attentions.Encoder(
-            hidden_channels,
-            filter_channels,
-            n_heads,
-            n_layers // 2,
-            kernel_size,
-            p_dropout,
-        )
-
         self.encoder_text = attentions.Encoder(
             hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout
         )
@@ -146,8 +137,6 @@ class TextEncoder(nn.Module):
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(
             y.dtype
         )
-
-        y = self.encoder_ssl(y * y_mask, y_mask)
 
         text_mask = torch.unsqueeze(
             commons.sequence_mask(text_lengths, text.size(1)), 1
@@ -813,6 +802,14 @@ class SynthesizerTrn(nn.Module):
         #     n_layers=2, kernel_size=5, p_dropout=0.1,
         #     mel_size=self.mel_size, gin_channels=gin_channels)
         # print("mel_dec:", count_parameters(self.mel_decoder))
+        self.encoder_ssl = attentions.Encoder(
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers // 2,
+            kernel_size,
+            p_dropout,
+        )
         self.enc_p = PosteriorAudioEncoder(
             spec_channels, inter_channels, hidden_channels,
             5, 1, 16, gin_channels=gin_channels)
@@ -838,10 +835,9 @@ class SynthesizerTrn(nn.Module):
         self.proj = nn.Conv1d(inter_channels, inter_channels, 2, stride=2)
         self.vq = vq
         self.vq2 = vq2
-        if self.vq:
+        if self.vq2:
             self.proj.requires_grad_(False)
             self.enc_p.requires_grad_(False)
-        if self.vq2:
             self.quantizer.requires_grad_(False)
 
     def forward(self, wav, wav_aug, wav_lengths, y, y_aug, y_lengths, text, text_lengths):
@@ -854,6 +850,7 @@ class SynthesizerTrn(nn.Module):
 
         x, m_p, logs_p = self.enc_p(y_aug, wav_aug.unsqueeze(1), y_mask)
         
+        x = self.encoder_ssl(x * y_mask, y_mask)
         x = self.proj(x)
         if self.vq:
             quantized, codes,\
@@ -889,6 +886,7 @@ class SynthesizerTrn(nn.Module):
         ge = self.ref_enc(y * y_mask, y_mask)
 
         x, _, _ = self.enc_p(y, wav.unsqueeze(1), y_mask)
+        x = self.encoder_ssl(x * y_mask, y_mask)
         x = self.proj(x)
         if self.vq:
             quantized, codes,\
@@ -934,6 +932,7 @@ class SynthesizerTrn(nn.Module):
 
         x, _, _ = self.enc_p(y, wav.unsqueeze(1), y_mask)
         
+        x = self.encoder_ssl(x * y_mask, y_mask)
         x = self.proj(x*y_mask)
         quantized, codes, commit_loss, quantized_list = self.quantizer(x)
         return codes.transpose(0, 1)

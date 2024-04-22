@@ -1,4 +1,10 @@
+import logging
+logging.getLogger("matplotlib").setLevel(logging.INFO)
+logging.getLogger("h5py").setLevel(logging.INFO)
+logging.getLogger("numba").setLevel(logging.WARNING)
 import copy
+import random
+import time
 from datetime import datetime
 import json
 from pathlib import Path
@@ -16,14 +22,15 @@ from torch import nn
 from torch.optim import AdamW
 from accelerate import Accelerator
 from ttts.vqvae.rvq1 import RVQ1
-from ttts.vqvae.vq2 import SynthesizerTrn
+from ttts.vqvae.vq3 import SynthesizerTrn
 from ttts.utils.data_utils import spec_to_mel_torch, mel_spectrogram_torch, HParams, spectrogram_torch
 from ttts.utils import commons
 import torchaudio
 from ttts.vqvae.losses import generator_loss, discriminator_loss, feature_loss, kl_loss
 from ttts.vqvae.hifigan import MultiPeriodDiscriminator
 from ttts.vqvae.augment import Augment
-
+from torchaudio.functional import phase_vocoder, resample, spectrogram
+from torch_pitch_shift import pitch_shift
 def set_requires_grad(model, val):
     for p in model.parameters():
         p.requires_grad = val
@@ -35,8 +42,10 @@ def get_grad_norm(model):
                 param_norm = p.grad.data.norm(2)
                 total_norm += param_norm.item() ** 2
             else:
+                # print(name)
                 continue
-        except:
+        except Exception as e:
+            print(e)
             print(name)
     total_norm = total_norm ** (1. / 2) 
     return total_norm
@@ -62,8 +71,64 @@ def clip_grad_value_(parameters, clip_value, norm_type=2):
             p.grad.data.clamp_(min=-clip_value, max=clip_value)
     total_norm = total_norm ** (1.0 / norm_type)
     return total_norm
+def Perturbing(
+    audios: torch.FloatTensor,
+    sample_rate: int= 32000,
+    f0_perturbation_factor_min: int= -6,
+    f0_perturbation_factor_max: int= 6,
+    pes_low_cutoff: int= 60,
+    pes_high_cutoff: int= 10000,
+    pes_q_min: float= 2.0,
+    pes_q_max: float= 5.0,
+    gain_min: float= -12.0,
+    gain_max: float= 12.0,
+    ):
+    step = random.choice([-17,-15,-14,-8,-4,7,8,12,13])
+    try:
+        audios = torchaudio.functional.pitch_shift(
+            audios.unsqueeze(1),
+            sample_rate= sample_rate,
+            n_steps= step,
+            bins_per_octave=12,
+            ).squeeze(1)
+    except Exception as e:
+        print(step)
+        print(e)
+    with torch.cuda.amp.autocast(enabled= False):   # equalizer_biquad does not support fp16
+        audios = audios.float()
+        cutoff_frequency_hls = torch.tensor(min(pes_low_cutoff // 2, sample_rate // 2)).to(audios.device)
+        cutoff_frequency_hhs = torch.tensor(min(pes_high_cutoff // 2, sample_rate // 2)).to(audios.device) # when over sample_rate // 2, audio is broken.
+        num_peaking_filters = 8
+        frequencies_peak = torch.logspace(cutoff_frequency_hls.log10(), cutoff_frequency_hhs.log10(), num_peaking_filters + 2)[1:-1]
+
+        audios = torchaudio.functional.equalizer_biquad(
+            waveform= audios,
+            sample_rate= sample_rate,
+            center_freq= cutoff_frequency_hhs,
+            gain= 0.0
+            )
+        audios = torchaudio.functional.equalizer_biquad(
+            waveform= audios,
+            sample_rate= sample_rate,
+            center_freq= cutoff_frequency_hls,
+            gain= 0.0
+            )
+        for x in frequencies_peak:
+            audios = torchaudio.functional.equalizer_biquad(
+            waveform= audios,
+            sample_rate= sample_rate,
+            center_freq= x,
+            gain= (gain_max - gain_min) * torch.rand(1) + gain_min,
+            Q= pes_q_min * (pes_q_max - pes_q_min) ** torch.rand(1)
+            )
+
+    return audios
+from accelerate import DistributedDataParallelKwargs
 class Trainer(object):
-    def __init__(self, cfg_path='ttts/vqvae/config.json'):
+    def __init__(self, cfg_path='ttts/vqvae/config_v3.json'):
+
+        # ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+        # self.accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
         self.accelerator = Accelerator()
         self.cfg = json.load(open(cfg_path))
         hps = HParams(**self.cfg)
@@ -79,6 +144,7 @@ class Trainer(object):
         collate_fn=VQVAECollater()
         self.dataloader = DataLoader(
             dataset,
+            # batch_size=hps.train.batch_size,
             num_workers=8,
             shuffle=False,
             pin_memory=True,
@@ -96,76 +162,21 @@ class Trainer(object):
         self.D = MultiPeriodDiscriminator()
         print("G params:", count_parameters(self.G))
         print("D params:", count_parameters(self.D))
-        self.G_optimizer = AdamW(self.G.parameters(),lr=3e-4, betas=(0.9, 0.9999), weight_decay=0.01)
-        self.D_optimizer = AdamW(self.D.parameters(),lr=3e-4, betas=(0.9, 0.9999), weight_decay=0.01)
-        self.G, self.G_optimizer, self.D, self.D_optimizer, self.dataloader = self.accelerator.prepare(
-            self.G, self.G_optimizer, self.D, self.D_optimizer, self.dataloader)
-        self.step=0
-        self.epoch=-1
-        self.gradient_accumulate_every=1
-        self.aug = Augment(hps)
-    def sample_like(self, signal: torch.Tensor) -> List[torch.Tensor]:
-        """Sample augmentation parameters.
-        Args:
-            signal: [torch.float32; [B, T]], speech signal.
-        Returns:
-            augmentation parameters.
-        """
-        # [B]
-        bsize, _ = signal.shape
-        def sampler(ratio):
-            shifts = torch.rand(bsize, device=signal.device) * (ratio - 1.) + 1.
-            # flip
-            flip = torch.rand(bsize) < 0.5
-            shifts[flip] = shifts[flip] ** -1
-            return shifts
-        # sample shifts
-        fs = sampler(self.config.train.formant_shift)
-        ps = sampler(self.config.train.pitch_shift)
-        pr = sampler(self.config.train.pitch_range)
-        # parametric equalizer
-        peaks = self.config.train.num_peak
-        # quality factor
-        power = torch.rand(bsize, peaks + 2, device=signal.device)
-        # gains
-        g_min, g_max = self.config.train.g_min, self.config.train.g_max
-        gain = torch.rand(bsize, peaks + 2, device=signal.device) * (g_max - g_min) + g_min
-        return fs, ps, pr, power, gain
+        self.G_optimizer = AdamW(self.G.parameters(), hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)
+        self.D_optimizer = AdamW(self.D.parameters(), hps.train.learning_rate, betas=hps.train.betas, eps=hps.train.eps)
 
-    def augment(self, signal: torch.Tensor, ps: bool = True) -> torch.Tensor:
-        """Augment the speech.
-        Args:
-            signal: [torch.float32; [B, T]], segmented speech.
-            ps: whether use pitch shift.
-        Returns:
-            [torch.float32; [B, T]], speech signal.
-        """
-        # B
-        bsize, _ = signal.shape
-        saves = None
-        while saves is None or len(saves) < bsize:
-            # [B] x 4
-            fshift, pshift, prange, power, gain = self.sample_like(signal)
-            if not ps:
-                pshift = None
-            # [B, T]
-            out = self.aug.forward(signal, pshift, prange, fshift, power, gain)
-            # for covering unexpected NaN
-            nan = out.isnan().any(dim=-1)
-            if not nan.all():
-                # save the outputs for not-nan inputs
-                if saves is None:
-                    saves = out[~nan]
-                else:
-                    saves = torch.cat([saves, out[~nan]], dim=0)
-        # [B, T]
-        return saves[:bsize]
-    def _get_target_encoder(self, model):
-        target_encoder = copy.deepcopy(model)
-        set_requires_grad(target_encoder, False)
-        for p in target_encoder.parameters():
-            p.DO_NOT_TRAIN = True
-        return target_encoder
+        self.scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
+            self.G_optimizer, gamma=hps.train.lr_decay, last_epoch=-1
+        )
+        self.scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
+            self.D_optimizer, gamma=hps.train.lr_decay, last_epoch=-1
+        )
+        self.G, self.G_optimizer, self.D, self.D_optimizer, self.dataloader, self.scheduler_g, self.scheduler_d = self.accelerator.prepare(
+            self.G, self.G_optimizer, self.D, self.D_optimizer, self.dataloader, self.scheduler_g, self.scheduler_d)
+        self.step=0
+        self.epoch=1
+        self.gradient_accumulate_every=1
+        # self.aug = Augment(hps)
     def save(self, milestone):
         if not self.accelerator.is_local_main_process:
             return
@@ -174,6 +185,8 @@ class Trainer(object):
             'epoch': self.epoch,
             'G': self.accelerator.get_state_dict(self.G),
             'D': self.accelerator.get_state_dict(self.D),
+            'G_opt': self.accelerator.get_state_dict(self.G_optimizer),
+            'D_opt': self.accelerator.get_state_dict(self.D_optimizer)
         }
         torch.save(data, str(self.logs_folder / f'model-{milestone}.pt'))
     def load(self, model_path):
@@ -182,25 +195,41 @@ class Trainer(object):
         data = torch.load(model_path, map_location=device)
         G_state_dict = data['G']
         D_state_dict = data['D']
+        G_opt_state_dict = data['G_opt']
+        D_opt_state_dict = data['D_opt']
         self.step = data['step']
         self.epoch = data['epoch']
         G = accelerator.unwrap_model(self.G)
-        G.load_state_dict(G_state_dict)
+        current_model_dict = G.state_dict()
+        G_state_dict={k:v if v.size()==current_model_dict[k].size()
+            # and 'quantizer' not in k
+            else  current_model_dict[k] for k,v in zip(current_model_dict.keys(), G_state_dict.values())}
+        G.load_state_dict(G_state_dict, strict=False)
         D = accelerator.unwrap_model(self.D)
         D.load_state_dict(D_state_dict)
+        G_opt = accelerator.unwrap_model(self.G_optimizer)
+        try:
+            G_opt.load_state_dict(G_opt_state_dict)
+        except:
+            print('Fail to load G_opt')
+        D_opt = accelerator.unwrap_model(self.D_optimizer)
+        D_opt.load_state_dict(D_opt_state_dict)
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-        self.aug = self.aug.to(device)
         hps = self.hps
         if accelerator.is_main_process:
             writer = SummaryWriter(log_dir=self.logs_folder)
         epoch=self.epoch
+        for _ in range(self.epoch):
+            self.scheduler_g.step()
+            self.scheduler_d.step()
         with tqdm(initial = self.step, total = self.train_steps, disable = not accelerator.is_main_process) as pbar:
             while self.step < self.train_steps:
                 self.dataloader.batch_sampler.epoch=epoch
-                epoch = epoch + 1
                 for data in self.dataloader:
+                    if data is None:
+                        continue
                     # with torch.autograd.detect_anomaly():
                     wav = data['wav'].to(device)
                     wav_length = data['wav_lengths'].to(device)
@@ -210,13 +239,14 @@ class Trainer(object):
                         self.hps.data.hop_length, self.hps.data.win_length, center=False).squeeze(0)
                     spec_length = torch.LongTensor([
                         x//self.hps.data.hop_length for x in wav_length]).to(device)
-                    wav_aug = self.augment(wav)
+                    # wav_aug = Perturbing(wav)
+                    wav_aug = wav
                     spec_aug = spectrogram_torch(wav_aug, self.hps.data.filter_length, self.hps.data.hop_length,
                                 self.hps.data.win_length, center=False).squeeze(0)
                     with self.accelerator.autocast():
-                        (y_hat, kl_ssl, ids_slice, z_mask,
-                            (z, z_p, m_p, logs_p, m_q, logs_q),
-                            stats_ssl,) = self.G(wav, wav_aug, wav_length, spec, spec_aug, spec_length, text, text_length)
+                        (y_hat, l_length1, l_length2, ids_slice, z_mask, x_mask,
+                            (z, z_p, m_p, logs_p, m_q, logs_q, z_t, m_t, logs_t, logs_p_raw),
+                            stats_ssl,) = self.G(spec, spec_aug, spec_length, text, text_length)
                         #  ssl, y, y_lengths, text, text_length
                         mel = spec_to_mel_torch(
                             spec,
@@ -249,52 +279,60 @@ class Trainer(object):
                         y_d_hat_r, y_d_hat_g
                     )
                     loss_disc_all = loss_disc
+                    self.D_optimizer.zero_grad()
                     self.accelerator.backward(loss_disc_all)
-                    D_grad_norm = get_grad_norm(self.D)
-                    # clip_grad_value_(self.D.parameters(), None)
-                    accelerator.clip_grad_norm_(self.D.parameters(), 1.0)
+                    grad_norm_d = commons.clip_grad_value_(self.D.parameters(), None)
                     accelerator.wait_for_everyone()
                     self.D_optimizer.step()
-                    self.D_optimizer.zero_grad()
                     accelerator.wait_for_everyone()
                     
+                    # unused_params =[]
+                    # G_ = self.accelerator.unwrap_model(self.G)
+                    # # unused_params.extend(list(G_.enc_p[-1].parameters()))
+                    # extraneous_addition = 0
+                    # for p in unused_params:
+                    #     extraneous_addition = extraneous_addition + p.mean()
                     # Generator
                     with self.accelerator.autocast():
                         y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.D(y, y_hat)
+                    loss_dur = torch.sum(l_length1.float()) + torch.sum(l_length2.float())
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * 45
-                    loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * 0.1
+                    loss_kl1 = kl_loss(z_t, logs_p_raw, m_t, logs_t, x_mask)
+                    loss_kl2 = kl_loss(z_p, logs_q, m_p, logs_p, z_mask)
                     loss_fm = feature_loss(fmap_r, fmap_g)
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                    loss_gen_all = loss_gen + loss_fm + loss_mel + kl_ssl + loss_kl
-                    model = self.accelerator.unwrap_model(self.G)
+                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl1 + loss_kl2 + loss_dur
+                    # model = self.accelerator.unwrap_model(self.G)
 
+                    self.G_optimizer.zero_grad()
                     self.accelerator.backward(loss_gen_all)
-                    G_grad_norm = get_grad_norm(self.G)
-                    accelerator.clip_grad_norm_(self.G.parameters(), 1.0)
-                    # clip_grad_value_(self.G.parameters(), None)
-                    pbar.set_description(f'G_loss:{loss_gen_all:.4f} D_loss:{loss_disc_all:.4f}')
+                    grad_norm_g = commons.clip_grad_value_(self.G.parameters(), None)
+                    get_grad_norm(self.G)
                     accelerator.wait_for_everyone()
                     self.G_optimizer.step()
-                    self.G_optimizer.zero_grad()
                     accelerator.wait_for_everyone()
+                    pbar.set_description(f'G_loss:{loss_gen_all:.4f} D_loss:{loss_disc_all:.4f}')
                     if accelerator.is_main_process and self.step % self.val_freq == 0:
+                        lr = self.G_optimizer.param_groups[0]["lr"]
                         with torch.no_grad():
                             eval_model = self.accelerator.unwrap_model(self.G)
                             eval_model.eval()
-                            wav_eval, _, _ = eval_model.infer(wav, wav_length, spec, spec_length, text, text_length)
+                            wav_eval = eval_model.infer(text, text_length, spec, spec_length, noise_scale=0.4)
                             eval_model.train()
                         scalar_dict = {"gen/loss_gen_all": loss_gen_all, "gen/loss_gen":loss_gen,
-                            'gen/loss_fm':loss_fm,'gen/loss_mel':loss_mel,'gen/kl_ssl':kl_ssl,
-                            'gen/loss_kl':loss_kl, "norm/G_grad": G_grad_norm, "norm/D_grad": D_grad_norm,
-                            'disc/loss_disc_all':loss_disc_all}
+                            'gen/loss_fm':loss_fm,'gen/loss_mel':loss_mel, 'gen/loss_kl2':loss_kl2,
+                            'gen/loss_kl1':loss_kl1, "gen/loss_dur":loss_dur, "norm/G_grad": grad_norm_g, "norm/D_grad": grad_norm_d,
+                            'disc/loss_disc_all':loss_disc_all,'gen/lr':lr}
                         image_dict = {
-                            "mel": plot_spectrogram_to_numpy(y_mel[0, :, :].detach().unsqueeze(-1).cpu()),
-                            "mel_pred": plot_spectrogram_to_numpy(y_hat_mel[0, :, :].detach().unsqueeze(-1).cpu()),
+                            "img/mel": plot_spectrogram_to_numpy(y_mel[0, :, :].detach().unsqueeze(-1).cpu()),
+                            "img/mel_pred": plot_spectrogram_to_numpy(y_hat_mel[0, :, :].detach().unsqueeze(-1).cpu()),
+                            "img/mel_raw": plot_spectrogram_to_numpy( mel[0].data.cpu().numpy()),
+                            "img/stats_ssl": plot_spectrogram_to_numpy(stats_ssl[0].data.cpu().numpy()),
                         }
                         audios_dict = {
-                            'gt':wav[0].detach().cpu(),
-                            'pert':wav_aug[0].detach().cpu(),
-                            'pred':wav_eval[0].detach().cpu()
+                            'wav/gt':wav[0].detach().cpu(),
+                            'wav/pert':wav_aug[0].detach().cpu(),
+                            'wav/pred':wav_eval[0].detach().cpu()
                         }
                         milestone = self.step // self.cfg['train']['save_freq'] 
                         torchaudio.save(str(self.logs_folder / f'sample-{milestone}.wav'), wav_eval[0].detach().cpu(), 32000)
@@ -313,10 +351,13 @@ class Trainer(object):
                         self.save(self.step//1000)
                     self.step += 1
                     pbar.update(1)
+                self.scheduler_g.step()
+                self.scheduler_d.step()
+                epoch = epoch + 1
         accelerator.print('training complete')
 
 
 if __name__ == '__main__':
     trainer = Trainer()
-    # trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/2024-03-17-15-24-41/model-5.pt')
+    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-04-22-15-17-22/model-8.pt')
     trainer.train()

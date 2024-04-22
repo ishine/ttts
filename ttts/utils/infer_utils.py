@@ -1,4 +1,4 @@
-from ttts.vqvae.vq2 import SynthesizerTrn
+from ttts.vqvae.vq3 import SynthesizerTrn
 from ttts.diffusion.model import DiffusionTts
 from ttts.gpt.model import UnifiedVoice
 from ttts.classifier.model import AudioMiniEncoderWithClassifierHead
@@ -23,7 +23,11 @@ def load_model(model_name, model_path, config_path, device):
             hps.train.segment_size // hps.data.hop_length,
             **hps.vqvae,
         )
-        sd = torch.load(model_path, map_location=device)['model']
+        vqvae = torch.load(model_path, map_location=device)
+        if 'model' in vqvae:
+            sd = vqvae['model']
+        if 'G' in vqvae:
+            sd = vqvae['G']
         model.load_state_dict(sd, strict=True)
         model = model.to(device)
     elif model_name=='gpt':
