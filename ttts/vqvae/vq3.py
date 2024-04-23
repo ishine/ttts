@@ -21,6 +21,40 @@ from ttts.utils.vc_utils import MultiHeadAttention
 from ttts.vqvae.alias_free_torch import *
 from ttts.vqvae import activations, monotonic_align
 
+class MRTE(nn.Module):
+    def __init__(
+        self,
+        content_enc_channels=192,
+        hidden_size=512,
+        out_channels=192,
+        kernel_size=5,
+        n_heads=4,
+        ge_layer=2,
+    ):
+        super(MRTE, self).__init__()
+        self.cross_attention = MultiHeadAttention(hidden_size, hidden_size, n_heads)
+        self.c_pre = nn.Conv1d(content_enc_channels, hidden_size, 1)
+        self.text_pre = nn.Conv1d(content_enc_channels, hidden_size, 1)
+        self.c_post = nn.Conv1d(hidden_size, out_channels, 1)
+
+    def forward(self, ssl_enc, ssl_mask, text, text_mask, ge):
+        if ge == None:
+            ge = 0
+        attn_mask = text_mask.unsqueeze(2) * ssl_mask.unsqueeze(-1)
+
+        ssl_enc = self.c_pre(ssl_enc * ssl_mask)
+        text_enc = self.text_pre(text * text_mask)
+    
+        x = (
+            self.cross_attention(
+                ssl_enc * ssl_mask, text_enc * text_mask, attn_mask
+            )
+            + ssl_enc
+            + ge
+        )
+        x = self.c_post(x * ssl_mask)
+        return x
+
 class TextEncoder(nn.Module):
     def __init__(
         self,
@@ -55,7 +89,7 @@ class TextEncoder(nn.Module):
         )
         self.text_embedding = nn.Embedding(256, hidden_channels)
         nn.init.normal_(self.text_embedding.weight, 0.0, hidden_channels**-0.5)
-        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+        # self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, text=None, text_lengths=None):
         text_mask = torch.unsqueeze(
@@ -63,10 +97,10 @@ class TextEncoder(nn.Module):
         ).to(text.dtype)
         text = self.text_embedding(text).transpose(1, 2)
         text = self.encoder(text * text_mask, text_mask)
-
-        stats = self.proj(text) * text_mask
-        m, logs = torch.split(stats, self.out_channels, dim=1)
-        return text, m, logs
+        return text, text_mask
+        # stats = self.proj(text) * text_mask
+        # m, logs = torch.split(stats, self.out_channels, dim=1)
+        # return text, m, logs
 
 class SpecEncoder(nn.Module):
     def __init__(
@@ -102,16 +136,20 @@ class SpecEncoder(nn.Module):
             kernel_size,
             p_dropout,
         )
+        self.out_proj = nn.Conv1d(hidden_channels, out_channels, 1)
         if self.gin_channels is not None:
             self.ge_proj = nn.Linear(gin_channels,hidden_channels)
         if self.sample==True:
-            self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+            self.proj = nn.Conv1d(out_channels, out_channels * 2, 1)
 
-    def forward(self, y=None, y_lengths=None):
+    def forward(self, y, y_lengths, g=None):
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(
             y.dtype
         )
+        if g is not None:
+            y = y + self.ge_proj(g.squeeze(-1)).unsqueeze(-1)
         y = self.encoder(y * y_mask, y_mask)
+        y = self.out_proj(y)
         if self.sample==False:
             return y
 
@@ -543,122 +581,69 @@ class SynthesizerTrn(nn.Module):
             latent_channels=192,
             gin_channels = None,
         )
+        self.mrte = MRTE()
         self.enc_p = []
         self.enc_p.extend(
             [
                 PosteriorEncoder(
                     spec_channels, inter_channels, hidden_channels, False,
                 5, 1, 16, gin_channels=gin_channels),
-                PosteriorEncoder(
-                    inter_channels, inter_channels, hidden_channels, False,
-                3, 1, 16, gin_channels=gin_channels),
-                PosteriorEncoder(
-                    inter_channels, inter_channels, hidden_channels, True,
-                3, 1, 16, gin_channels=gin_channels),
-                # SpecEncoder(
-                #     inter_channels, hidden_channels, filter_channels, True, n_heads,
-                # n_layers, kernel_size, p_dropout),
+                SpecEncoder(
+                    inter_channels, hidden_channels, filter_channels, False, n_heads,
+                n_layers, kernel_size, p_dropout,gin_channels=gin_channels),
+                SpecEncoder(
+                    inter_channels, hidden_channels, filter_channels, False, n_heads,
+                n_layers, kernel_size, p_dropout,gin_channels=gin_channels),
+                SpecEncoder(
+                    inter_channels, hidden_channels, filter_channels, False, n_heads,
+                n_layers, kernel_size, p_dropout),
+                SpecEncoder(
+                    inter_channels, hidden_channels, filter_channels, True, n_heads,
+                n_layers, kernel_size, p_dropout),
             ]
         )
         self.enc_p = nn.ModuleList(self.enc_p)
         self.enc_q = PosteriorEncoder(
             spec_channels, inter_channels, hidden_channels, True,
             5, 1, 16, gin_channels=gin_channels)
-        self.flow1 = ResidualCouplingBlock(
-            inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels
-        )
-        self.flow2 = ResidualCouplingBlock(
+        self.flow = ResidualCouplingBlock(
             inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels
         )
         self.ref_enc = modules.MelStyleEncoder(
             spec_channels, style_vector_dim=gin_channels
         )
+        self.quantizer = ResidualVectorQuantizer(dimension=inter_channels, n_q=1, bins=4096)
         self.proj = []
         self.proj.extend([nn.Conv1d(inter_channels, inter_channels, kernel_size=2, stride=2) for _ in range(2)])
         self.proj = nn.ModuleList(self.proj)
-        self.norm = []
-        self.norm.extend([modules.LayerNorm(inter_channels) for _ in range(2)])
-        self.norm = nn.ModuleList(self.norm)
-        self.dp = DurationPredictor(
-            hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
-        )
-        self.dp2 = DurationPredictor(
-            hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
-        )
+        self.proj_out = []
+        self.proj_out.extend([nn.ConvTranspose1d(inter_channels, inter_channels, kernel_size=2, stride=2) for _ in range(2)])
+        self.proj_out = nn.ModuleList(self.proj_out)
 
-    def mas(self,z_p,m_p,logs_p,x_mask,y_mask):
-        with torch.no_grad():
-            # negative cross-entropy
-            s_p_sq_r = torch.exp(-2 * logs_p)  # [b, d, t]
-            neg_cent1 = torch.sum(
-                -0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True
-            )  # [b, 1, t_s]
-            neg_cent2 = torch.matmul(
-                -0.5 * (z_p**2).transpose(1, 2), s_p_sq_r
-            )  # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
-            neg_cent3 = torch.matmul(
-                z_p.transpose(1, 2), (m_p * s_p_sq_r)
-            )  # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
-            neg_cent4 = torch.sum(
-                -0.5 * (m_p**2) * s_p_sq_r, [1], keepdim=True
-            )  # [b, 1, t_s]
-            neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
-            attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-            attn = (
-                monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1))
-                .unsqueeze(1)
-                .detach()
-            )
-        return attn
     def forward(self, y, y_aug, y_lengths, text, text_lengths, semantic=None):
         # with profiler.profile(with_stack=True, profile_memory=True) as prof:
-        text_mask = torch.unsqueeze(
-            commons.sequence_mask(text_lengths, text.size(1)), 1).to(text.dtype)
         y_mask = torch.unsqueeze(
             commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
-        x_mask = torch.unsqueeze(
-            commons.sequence_mask(y_lengths//(2**2), y.size(2)//(2**2)), 1).to(y.dtype)
         ge = self.ref_enc(y * y_mask, y_mask)
+        ge_aug = self.ref_enc(y_aug * y_mask,y_mask)
 
-        text, m_t, logs_t = self.t_enc(text, text_lengths)
-        quantized = text
+        text, text_mask = self.t_enc(text, text_lengths)
 
-        x = self.enc_p[0](y_aug, y_lengths, g=ge)
+        x = self.enc_p[0](y_aug, y_lengths, g=ge_aug)
         x = self.proj[0](x)
-        x = self.norm[0](x)
-        x = self.enc_p[1](x, y_lengths//2, g=ge)
+        x = self.enc_p[1](x, y_lengths//2, g=ge_aug)
         x = self.proj[1](x)
-        x = self.norm[1](x)
-        x, m_p, logs_p = self.enc_p[2](x,y_lengths//4, g=ge)
-        logs_p_raw = logs_p
-        z_t = self.flow1(x, x_mask, g=ge)
+        x = self.enc_p[2](x,y_lengths//4, g=ge_aug)
+        quantized, codes, commit_loss, quantized_list = self.quantizer(x, layers=[0])
+        x = self.proj_out[0](quantized)
+        x = self.enc_p[3](x,y_lengths//2)
+        x = self.proj_out[1](x)
+        x = self.mrte(x, y_mask, text, text_mask, ge)
+        x, m_p, logs_p = self.enc_p[4](x,y_lengths)
+        quantized = x
 
-        attn1 = self.mas(z_t,m_t,logs_t,text_mask,x_mask)
-        w = attn1.sum(2)
-        logw_ = torch.log(w + 1e-6) * text_mask
-        logw = self.dp(text, text_mask, g=ge)
-        l_length1 = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
-            text_mask
-        )  # for averaging
-
-
-        z, m_q, logs_q = self.enc_q(y, y_lengths, g=ge)
-        z_p = self.flow2(z, y_mask, g=ge)
-
-        attn2 = self.mas(z_p,m_p,logs_p,x_mask,y_mask)
-        w = attn2.sum(2)
-        logw_ = torch.log(w + 1e-6) * x_mask
-        logw = self.dp2(x, x_mask, g=ge)
-        l_length2 = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
-            x_mask
-        )  # for averaging
-
-        # expand prior
-        m_t = torch.matmul(attn1.squeeze(1), m_t.transpose(1, 2)).transpose(1, 2)
-        logs_t = torch.matmul(attn1.squeeze(1), logs_t.transpose(1, 2)).transpose(1, 2)
-        quantized = torch.matmul(attn1.squeeze(1), quantized.transpose(1, 2)).transpose(1, 2)
-        m_p = torch.matmul(attn2.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
-        logs_p = torch.matmul(attn2.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
+        z, m_q, logs_q = self.enc_q(y, y_lengths,ge)
+        z_p = self.flow(z, y_mask, g=ge)
 
         z_slice, ids_slice = commons.rand_slice_segments(
             z, y_lengths, self.segment_size
@@ -666,63 +651,33 @@ class SynthesizerTrn(nn.Module):
         o = self.dec(z_slice, g=ge)
         return (
             o,
-            l_length1,
-            l_length2,
+            commit_loss,
             ids_slice,
             y_mask,
-            x_mask,
-            (z, z_p, m_p, logs_p, m_q, logs_q, z_t, m_t, logs_t, logs_p_raw),
+            (z, z_p, m_p, logs_p, m_q, logs_q),
             quantized,
         )
 
-    def infer(self, text, text_lengths, refer, refer_lengths, noise_scale=0.667, length_scale=1.0):
-        text_mask = torch.unsqueeze(
-            commons.sequence_mask(text_lengths, text.size(1)), 1).to(refer.dtype)
-        refer_mask = torch.unsqueeze(
-            commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
-        ge = self.ref_enc(refer * refer_mask, refer_mask)
+    def infer(self, y, y_lengths, text, text_lengths, refer, refer_lengths, noise_scale=0.667):
+        y_mask = torch.unsqueeze(
+            commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
+        ge = self.ref_enc(y * y_mask, y_mask)
 
-        text, m_t, logs_t = self.t_enc(text, text_lengths)
+        text, text_mask = self.t_enc(text, text_lengths)
 
-        logw =  self.dp(text, text_mask, g=ge)
-        w = torch.exp(logw) * text_mask * length_scale
-        w_ceil = torch.ceil(w)
-        x_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-        x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, None), 1).to(
-            refer.dtype
-        )
-        attn_mask = torch.unsqueeze(text_mask, 2) * torch.unsqueeze(x_mask, -1)
-        attn = commons.generate_path(w_ceil, attn_mask)
-        m_t = torch.matmul(attn.squeeze(1), m_t.transpose(1, 2)).transpose(
-            1, 2
-        )  # [b, t', t], [b, t, d] -> [b, d, t']
-        logs_t = torch.matmul(attn.squeeze(1), logs_t.transpose(1, 2)).transpose(
-            1, 2
-        )  # [b, t', t], [b, t, d] -> [b, d, t']
-        z_t = m_t + torch.randn_like(m_t) * torch.exp(logs_t) * noise_scale
-        x = self.flow1(z_t, x_mask, g=ge, reverse=True)
-
-        stats = self.enc_p[-1].proj(x) * x_mask
-        m_p, logs_p = torch.split(stats, self.inter_channels, dim=1)
-        logw =  self.dp2(x, x_mask, g=ge)
-        w = torch.exp(logw) * x_mask * length_scale
-        w_ceil = torch.ceil(w)
-        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
-            x.dtype
-        )
-        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-        attn = commons.generate_path(w_ceil, attn_mask)
-
-        m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(
-            1, 2
-        )  # [b, t', t], [b, t, d] -> [b, d, t']
-        logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(
-            1, 2
-        )  # [b, t', t], [b, t, d] -> [b, d, t']
+        x = self.enc_p[0](y, y_lengths, g=ge)
+        x = self.proj[0](x)
+        x = self.enc_p[1](x, y_lengths//2, g=ge)
+        x = self.proj[1](x)
+        x = self.enc_p[2](x,y_lengths//4, g=ge)
+        quantized, codes, commit_loss, quantized_list = self.quantizer(x, layers=[0])
+        x = self.proj_out[0](quantized)
+        x = self.enc_p[3](x,y_lengths//2)
+        x = self.proj_out[1](x)
+        x = self.mrte(x, y_mask, text, text_mask, ge)
+        x, m_p, logs_p = self.enc_p[4](x,y_lengths)
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
-        z = self.flow2(z_p, y_mask, g=ge, reverse=True)
-
+        z = self.flow(z_p, y_mask, g=ge, reverse=True)
         o = self.dec(z, g=ge)
         return  o
     def vc(self, y, y_lengths, refer, refer_lengths, noise_scale=0.5):
