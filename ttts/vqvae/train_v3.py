@@ -4,6 +4,7 @@ logging.getLogger("h5py").setLevel(logging.INFO)
 logging.getLogger("numba").setLevel(logging.WARNING)
 import copy
 import random
+import faiss
 import time
 from datetime import datetime
 import json
@@ -218,6 +219,7 @@ class Trainer(object):
         accelerator = self.accelerator
         device = accelerator.device
         hps = self.hps
+
         if accelerator.is_main_process:
             writer = SummaryWriter(log_dir=self.logs_folder)
         epoch=self.epoch
@@ -239,13 +241,13 @@ class Trainer(object):
                         self.hps.data.hop_length, self.hps.data.win_length, center=False).squeeze(0)
                     spec_length = torch.LongTensor([
                         x//self.hps.data.hop_length for x in wav_length]).to(device)
-                    wav_aug = Perturbing(wav)
-                    # wav_aug = wav
+                    # wav_aug = Perturbing(wav)
+                    wav_aug = wav
                     spec_aug = spectrogram_torch(wav_aug, self.hps.data.filter_length, self.hps.data.hop_length,
                                 self.hps.data.win_length, center=False).squeeze(0)
                     with self.accelerator.autocast():
-                        (y_hat, commit_loss, ids_slice, z_mask,
-                            (z, z_p, m_p, logs_p, m_q, logs_q),
+                        (y_hat, ids_slice, l_length, l_detail, z_mask,
+                            (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),
                             stats_ssl,) = self.G(spec, spec_aug, spec_length, text, text_length)
                         #  ssl, y, y_lengths, text, text_length
                         mel = spec_to_mel_torch(
@@ -295,11 +297,15 @@ class Trainer(object):
                     # Generator
                     with self.accelerator.autocast():
                         y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.D(y, y_hat)
+                    loss_detail = l_detail
+                    loss_dur = torch.sum(l_length.float())
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * 45
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask)
+                    loss_kl_text = kl_loss(z_p, logs_q, m_t, logs_t, z_mask)
                     loss_fm = feature_loss(fmap_r, fmap_g)
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
-                    loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
+                    loss_gen_all = loss_gen + loss_fm + loss_mel \
+                        + loss_kl + loss_kl_text + loss_dur + loss_detail
                     # model = self.accelerator.unwrap_model(self.G)
 
                     self.G_optimizer.zero_grad()
@@ -318,8 +324,9 @@ class Trainer(object):
                             wav_eval = eval_model.infer(spec, spec_length, text, text_length, spec, spec_length)
                             eval_model.train()
                         scalar_dict = {"gen/loss_gen_all": loss_gen_all, "gen/loss_gen":loss_gen,
-                            'gen/loss_fm':loss_fm,'gen/loss_mel':loss_mel,'gen/commit_loss':commit_loss,
-                            'gen/loss_kl':loss_kl, "norm/G_grad": grad_norm_g, "norm/D_grad": grad_norm_d,
+                            'gen/loss_fm':loss_fm,'gen/loss_mel':loss_mel,'gen/loss_dur':loss_dur,
+                            'gen/loss_detail':loss_detail,
+                            'gen/loss_kl':loss_kl, 'gen/loss_kl_text':loss_kl_text,"norm/G_grad": grad_norm_g, "norm/D_grad": grad_norm_d,
                             'disc/loss_disc_all':loss_disc_all,'gen/lr':lr}
                         image_dict = {
                             "img/mel": plot_spectrogram_to_numpy(y_mel[0, :, :].detach().unsqueeze(-1).cpu()),
@@ -357,5 +364,5 @@ class Trainer(object):
 
 if __name__ == '__main__':
     trainer = Trainer()
-    # trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-04-23-05-32-07/model-14.pt')
+    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-01-11-57-50/model-75.pt')
     trainer.train()

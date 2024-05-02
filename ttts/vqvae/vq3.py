@@ -2,9 +2,11 @@ import logging
 logging.getLogger("matplotlib").setLevel(logging.INFO)
 logging.getLogger("h5py").setLevel(logging.INFO)
 logging.getLogger("numba").setLevel(logging.WARNING)
+from einops import rearrange, repeat
 import copy
 import time
 import torch.autograd.profiler as profiler
+import faiss
 import math
 import torch
 from torch import nn
@@ -32,7 +34,7 @@ class MRTE(nn.Module):
         ge_layer=2,
     ):
         super(MRTE, self).__init__()
-        self.cross_attention = MultiHeadAttention(hidden_size, hidden_size, n_heads)
+        # self.cross_attention = MultiHeadAttention(hidden_size, hidden_size, n_heads)
         self.c_pre = nn.Conv1d(content_enc_channels, hidden_size, 1)
         self.text_pre = nn.Conv1d(content_enc_channels, hidden_size, 1)
         self.c_post = nn.Conv1d(hidden_size, out_channels, 1)
@@ -46,9 +48,10 @@ class MRTE(nn.Module):
         text_enc = self.text_pre(text * text_mask)
     
         x = (
-            self.cross_attention(
-                ssl_enc * ssl_mask, text_enc * text_mask, attn_mask
-            )
+            # self.cross_attention(
+            #     ssl_enc * ssl_mask, text_enc * text_mask, attn_mask
+            # )
+            text_enc
             + ssl_enc
             + ge
         )
@@ -89,7 +92,7 @@ class TextEncoder(nn.Module):
         )
         self.text_embedding = nn.Embedding(256, hidden_channels)
         nn.init.normal_(self.text_embedding.weight, 0.0, hidden_channels**-0.5)
-        # self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
+        self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
     def forward(self, text=None, text_lengths=None):
         text_mask = torch.unsqueeze(
@@ -97,10 +100,10 @@ class TextEncoder(nn.Module):
         ).to(text.dtype)
         text = self.text_embedding(text).transpose(1, 2)
         text = self.encoder(text * text_mask, text_mask)
-        return text, text_mask
-        # stats = self.proj(text) * text_mask
-        # m, logs = torch.split(stats, self.out_channels, dim=1)
-        # return text, m, logs
+        # return text, text_mask
+        stats = self.proj(text) * text_mask
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        return text, m, logs, text_mask
 
 class SpecEncoder(nn.Module):
     def __init__(
@@ -464,6 +467,115 @@ class MultiPeriodDiscriminator(torch.nn.Module):
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
+class StochasticDurationPredictor(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        filter_channels,
+        kernel_size,
+        p_dropout,
+        n_flows=4,
+        gin_channels=0,
+    ):
+        super().__init__()
+        filter_channels = in_channels  # it needs to be removed from future version.
+        self.in_channels = in_channels
+        self.filter_channels = filter_channels
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.n_flows = n_flows
+        self.gin_channels = gin_channels
+
+        self.log_flow = modules.Log()
+        self.flows = nn.ModuleList()
+        self.flows.append(modules.ElementwiseAffine(2))
+        for i in range(n_flows):
+            self.flows.append(
+                modules.ConvFlow(2, filter_channels, kernel_size, n_layers=3)
+            )
+            self.flows.append(modules.Flip())
+
+        self.post_pre = nn.Conv1d(1, filter_channels, 1)
+        self.post_proj = nn.Conv1d(filter_channels, filter_channels, 1)
+        self.post_convs = modules.DDSConv(
+            filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout
+        )
+        self.post_flows = nn.ModuleList()
+        self.post_flows.append(modules.ElementwiseAffine(2))
+        for i in range(4):
+            self.post_flows.append(
+                modules.ConvFlow(2, filter_channels, kernel_size, n_layers=3)
+            )
+            self.post_flows.append(modules.Flip())
+
+        self.pre = nn.Conv1d(in_channels, filter_channels, 1)
+        self.proj = nn.Conv1d(filter_channels, filter_channels, 1)
+        self.convs = modules.DDSConv(
+            filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout
+        )
+        if gin_channels != 0:
+            self.cond = nn.Conv1d(gin_channels, filter_channels, 1)
+
+    def forward(self, x, x_mask, w=None, g=None, reverse=False, noise_scale=1.0):
+        x = torch.detach(x)
+        x = self.pre(x)
+        if g is not None:
+            g = torch.detach(g)
+            x = x + self.cond(g)
+        x = self.convs(x, x_mask)
+        x = self.proj(x) * x_mask
+
+        if not reverse:
+            flows = self.flows
+            assert w is not None
+
+            logdet_tot_q = 0
+            h_w = self.post_pre(w)
+            h_w = self.post_convs(h_w, x_mask)
+            h_w = self.post_proj(h_w) * x_mask
+            e_q = (
+                torch.randn(w.size(0), 2, w.size(2)).to(device=x.device, dtype=x.dtype)
+                * x_mask
+            )
+            z_q = e_q
+            for flow in self.post_flows:
+                z_q, logdet_q = flow(z_q, x_mask, g=(x + h_w))
+                logdet_tot_q += logdet_q
+            z_u, z1 = torch.split(z_q, [1, 1], 1)
+            u = torch.sigmoid(z_u) * x_mask
+            z0 = (w - u) * x_mask
+            logdet_tot_q += torch.sum(
+                (F.logsigmoid(z_u) + F.logsigmoid(-z_u)) * x_mask, [1, 2]
+            )
+            logq = (
+                torch.sum(-0.5 * (math.log(2 * math.pi) + (e_q**2)) * x_mask, [1, 2])
+                - logdet_tot_q
+            )
+
+            logdet_tot = 0
+            z0, logdet = self.log_flow(z0, x_mask)
+            logdet_tot += logdet
+            z = torch.cat([z0, z1], 1)
+            for flow in flows:
+                z, logdet = flow(z, x_mask, g=x, reverse=reverse)
+                logdet_tot = logdet_tot + logdet
+            nll = (
+                torch.sum(0.5 * (math.log(2 * math.pi) + (z**2)) * x_mask, [1, 2])
+                - logdet_tot
+            )
+            return nll + logq  # [b]
+        else:
+            flows = list(reversed(self.flows))
+            flows = flows[:-2] + [flows[-1]]  # remove a useless vflow
+            z = (
+                torch.randn(x.size(0), 2, x.size(2)).to(device=x.device, dtype=x.dtype)
+                * noise_scale
+            )
+            for flow in flows:
+                z = flow(z, x_mask, g=x, reverse=reverse)
+            z0, z1 = torch.split(z, [1, 1], 1)
+            logw = z0
+            return logw
 
 class DurationPredictor(nn.Module):
     def __init__(
@@ -535,8 +647,7 @@ class SynthesizerTrn(nn.Module):
         n_speakers=0,
         gin_channels=0,
         semantic_frame_rate=None,
-        down_times=2,
-        stage2=None,
+        vq=False,
         **kwargs
     ):
         super().__init__()
@@ -558,7 +669,7 @@ class SynthesizerTrn(nn.Module):
         self.n_speakers = n_speakers
         self.gin_channels = gin_channels
         self.mel_size = prosody_size
-        self.down_times=down_times
+        self.vq = vq
 
         self.dec = Generator(
             inter_channels,
@@ -581,7 +692,20 @@ class SynthesizerTrn(nn.Module):
             latent_channels=192,
             gin_channels = None,
         )
-        self.mrte = MRTE()
+        self.detail_enc = SpecEncoder(
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            False,
+            n_heads,
+            6,
+            kernel_size,
+            p_dropout,
+            latent_channels=192,
+            gin_channels = gin_channels,
+        )
+
+        # self.mrte = MRTE()
         self.enc_p = []
         self.enc_p.extend(
             [
@@ -592,16 +716,11 @@ class SynthesizerTrn(nn.Module):
                     inter_channels, hidden_channels, filter_channels, False, n_heads,
                 n_layers, kernel_size, p_dropout,gin_channels=gin_channels),
                 SpecEncoder(
-                    inter_channels, hidden_channels, filter_channels, False, n_heads,
-                n_layers, kernel_size, p_dropout,gin_channels=gin_channels),
-                SpecEncoder(
-                    inter_channels, hidden_channels, filter_channels, False, n_heads,
-                n_layers, kernel_size, p_dropout),
-                SpecEncoder(
                     inter_channels, hidden_channels, filter_channels, True, n_heads,
-                n_layers, kernel_size, p_dropout),
+                n_layers, kernel_size, p_dropout,gin_channels=gin_channels),
             ]
         )
+        self.quantizer = ResidualVectorQuantizer(dimension=inter_channels, n_q=1, bins=4096)
         self.enc_p = nn.ModuleList(self.enc_p)
         self.enc_q = PosteriorEncoder(
             spec_channels, inter_channels, hidden_channels, True,
@@ -612,38 +731,76 @@ class SynthesizerTrn(nn.Module):
         self.ref_enc = modules.MelStyleEncoder(
             spec_channels, style_vector_dim=gin_channels
         )
-        self.quantizer = ResidualVectorQuantizer(dimension=inter_channels, n_q=1, bins=4096)
-        self.proj = []
-        self.proj.extend([nn.Conv1d(inter_channels, inter_channels, kernel_size=2, stride=2) for _ in range(2)])
-        self.proj = nn.ModuleList(self.proj)
-        self.proj_out = []
-        self.proj_out.extend([nn.ConvTranspose1d(inter_channels, inter_channels, kernel_size=2, stride=2) for _ in range(2)])
-        self.proj_out = nn.ModuleList(self.proj_out)
-
-    def forward(self, y, y_aug, y_lengths, text, text_lengths, semantic=None):
-        # with profiler.profile(with_stack=True, profile_memory=True) as prof:
+        self.dp = DurationPredictor(
+            hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
+        )
+        self.sdp = StochasticDurationPredictor(
+            hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels
+        )
+    def mas(self,z_p,m_p,logs_p,x_mask,y_mask):
+        with torch.no_grad():
+            # negative cross-entropy
+            s_p_sq_r = torch.exp(-2 * logs_p)  # [b, d, t]
+            neg_cent1 = torch.sum(
+                -0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True
+            )  # [b, 1, t_s]
+            neg_cent2 = torch.matmul(
+                -0.5 * (z_p**2).transpose(1, 2), s_p_sq_r
+            )  # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
+            neg_cent3 = torch.matmul(
+                z_p.transpose(1, 2), (m_p * s_p_sq_r)
+            )  # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
+            neg_cent4 = torch.sum(
+                -0.5 * (m_p**2) * s_p_sq_r, [1], keepdim=True
+            )  # [b, 1, t_s]
+            neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
+            attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+            attn = (
+                monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1))
+                .unsqueeze(1)
+                .detach()
+            )
+        return attn
+    def forward(self, y, y_aug, y_lengths, text, text_lengths):
         y_mask = torch.unsqueeze(
             commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
         ge = self.ref_enc(y * y_mask, y_mask)
         ge_aug = self.ref_enc(y_aug * y_mask,y_mask)
 
-        text, text_mask = self.t_enc(text, text_lengths)
-
-        x = self.enc_p[0](y_aug, y_lengths, g=ge_aug)
-        x = self.proj[0](x)
-        x = self.enc_p[1](x, y_lengths//2, g=ge_aug)
-        x = self.proj[1](x)
-        x = self.enc_p[2](x,y_lengths//4, g=ge_aug)
-        quantized, codes, commit_loss, quantized_list = self.quantizer(x, layers=[0])
-        x = self.proj_out[0](quantized)
-        x = self.enc_p[3](x,y_lengths//2)
-        x = self.proj_out[1](x)
-        x = self.mrte(x, y_mask, text, text_mask, ge)
-        x, m_p, logs_p = self.enc_p[4](x,y_lengths)
-        quantized = x
+        text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
 
         z, m_q, logs_q = self.enc_q(y, y_lengths,ge)
         z_p = self.flow(z, y_mask, g=ge)
+
+        attn = self.mas(z_p, m_t, logs_t, text_mask, y_mask)
+        x_mask = text_mask
+        w = attn.sum(2)
+
+        l_length_sdp = self.sdp(text, x_mask, w, g=ge)
+        l_length_sdp = l_length_sdp / torch.sum(x_mask)
+        logw_ = torch.log(w + 1e-6) * x_mask
+        logw = self.dp(text, x_mask, g=ge)
+        logw_sdp = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=1.0)
+        l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
+            x_mask
+        )  # for averaging
+        l_length_sdp += torch.sum((logw_sdp - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
+
+        l_length = l_length_dp + l_length_sdp
+
+        # expand prior
+        m_t = torch.matmul(attn.squeeze(1), m_t.transpose(1, 2)).transpose(1, 2)
+        logs_t = torch.matmul(attn.squeeze(1), logs_t.transpose(1, 2)).transpose(1, 2)
+        text =  torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1, 2)
+
+        x = self.enc_p[0](y_aug, y_lengths, g=ge_aug)
+        x = self.enc_p[1](x, y_lengths, g=ge_aug)
+        detail = x
+        detail_ = self.detail_enc(text, y_lengths, g=ge)
+        l_detail = torch.sum(((detail - detail_) ** 2)*y_mask) / torch.sum(y_mask)
+        x = detail + text
+        x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
+        quantized = x
 
         z_slice, ids_slice = commons.rand_slice_segments(
             z, y_lengths, self.segment_size
@@ -651,82 +808,124 @@ class SynthesizerTrn(nn.Module):
         o = self.dec(z_slice, g=ge)
         return (
             o,
-            commit_loss,
             ids_slice,
+            l_length,
+            l_detail,
             y_mask,
-            (z, z_p, m_p, logs_p, m_q, logs_q),
+            (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),
             quantized,
         )
 
-    def infer(self, y, y_lengths, text, text_lengths, refer, refer_lengths, noise_scale=0.667):
+
+    def infer(self, y, y_lengths, text, text_lengths, refer, refer_lengths, noise_scale=0.667,sdp_ratio=0.2,noise_scale_w=0.8,length_scale=1.0):
         y_mask = torch.unsqueeze(
             commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
         ge = self.ref_enc(y * y_mask, y_mask)
 
-        text, text_mask = self.t_enc(text, text_lengths)
+        text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
+        x_mask = text_mask
 
-        x = self.enc_p[0](y, y_lengths, g=ge)
-        x = self.proj[0](x)
-        x = self.enc_p[1](x, y_lengths//2, g=ge)
-        x = self.proj[1](x)
-        x = self.enc_p[2](x,y_lengths//4, g=ge)
-        quantized, codes, commit_loss, quantized_list = self.quantizer(x, layers=[0])
-        x = self.proj_out[0](quantized)
-        x = self.enc_p[3](x,y_lengths//2)
-        x = self.proj_out[1](x)
-        x = self.mrte(x, y_mask, text, text_mask, ge)
-        x, m_p, logs_p = self.enc_p[4](x,y_lengths)
+        logw = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=noise_scale_w) * (
+            sdp_ratio
+        ) + self.dp(text, x_mask, g=ge) * (1 - sdp_ratio)
+        w = torch.exp(logw) * x_mask * length_scale
+        w_ceil = torch.ceil(w)
+        y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
+            x_mask.dtype
+        )
+        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+        attn = commons.generate_path(w_ceil, attn_mask).float()
+        text = torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1,2)
+
+        detail = self.detail_enc(text, y_lengths, g=ge)
+        x = detail + text
+        x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
+
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=ge, reverse=True)
         o = self.dec(z, g=ge)
         return  o
-    def vc(self, y, y_lengths, refer, refer_lengths, noise_scale=0.5):
-        pass
 
-    @torch.no_grad()
-    def decode(self, codes, refer, noise_scale=0.5):
-        pass
-        # ge = None
-        # refer_lengths = torch.LongTensor([refer.size(2)]).to(refer.device)
-        # refer_mask = torch.unsqueeze(
-        #     commons.sequence_mask(refer_lengths, refer.size(2)), 1
-        # ).to(refer.dtype)
-        # ge = self.ref_enc(refer * refer_mask, refer_mask)
-
-        # quantized = self.quantizer.decode(codes)
-        # y_lengths = torch.LongTensor([quantized.size(2)]).to(quantized.device)
-        # x, m_p, logs_p = self.enc_p[-1](quantized,y_lengths)
-        # logw = self.dp(x, x_mask, g=ge)
-        # w = torch.exp(logw) * x_mask * length_scale
-        # w_ceil = torch.ceil(w)
-        # y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-        # y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
-        #     x_mask.dtype
-        # )
-        # attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-        # attn = commons.generate_path(w_ceil, attn_mask)
-
-        # m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(
-        #     1, 2
-        # )  # [b, t', t], [b, t, d] -> [b, d, t']
-        # logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(
-        #     1, 2
-        # )  # [b, t', t], [b, t, d] -> [b, d, t']
-        # z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
-        # z = self.flow(z_p, y_mask, g=ge, reverse=True)
-        # o = self.dec((z * y_mask)[:, :, :], g=ge)
-        # return o
-    def extract_feature(self,y,y_lengths):
+    def infer_ar(self, y, y_lengths, text, text_lengths, refer, refer_lengths,  big_npy=None, index=None, noise_scale=0.667,sdp_ratio=0,noise_scale_w=0.8,length_scale=1.0):
         y_mask = torch.unsqueeze(
             commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
-        x_mask = torch.unsqueeze(
-            commons.sequence_mask(y_lengths//(2**self.down_times), y.size(2)//(2**self.down_times)), 1).to(y.dtype)
         ge = self.ref_enc(y * y_mask, y_mask)
 
-        x = self.enc_p_pre(y, y_lengths)
-        for i in range(self.down_times):
-            x = self.proj[i](x)
-            x = self.norm[i](x)
-            x = self.enc_p[i](x,y_lengths//(2**(i+1)))
-        x, m_p, logs_p = self.enc_p[-1](x,y_lengths//(2**(self.down_times)))
-        return x
+        text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
+
+        z, m_q, logs_q = self.enc_q(y, y_lengths,ge)
+        z_p = self.flow(z, y_mask, g=ge)
+
+        attn = self.mas(z_p, m_t, logs_t, text_mask, y_mask)
+        x_mask = text_mask
+        w = attn.sum(2)
+
+        y_lengths = torch.clamp_min(torch.sum(w, [1, 2]), 1).long()
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
+            x_mask.dtype
+        )
+        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+        attn = commons.generate_path(w, attn_mask).float()
+        text = torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1,2)
+
+        detail = self.detail_enc(text, y_lengths, g=ge)
+        x = detail + text
+        x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
+
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+        z = self.flow(z_p, y_mask, g=ge, reverse=True)
+        o = self.dec(z, g=ge)
+        return  o
+    @torch.no_grad()
+    def decode(self, text, text_lengths, refer, refer_lengths, dur, noise_scale=0.5):
+        refer_mask = torch.unsqueeze(
+            commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
+        ge = self.ref_enc(refer * refer_mask, refer_mask)
+        text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
+        x_mask = text_mask
+        w = dur
+        y_lengths = torch.clamp_min(torch.sum(w, [1, 2]), 1).long()
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
+            x_mask.dtype
+        )
+        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+        attn = commons.generate_path(w, attn_mask).float()
+        text = torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1,2)
+
+        detail = self.detail_enc(text, y_lengths, g=ge)
+        x = detail + text
+        x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
+
+        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+        z = self.flow(z_p, y_mask, g=ge, reverse=True)
+        o = self.dec(z, g=ge)
+        return  o
+    def extract_dur(self, text, text_lengths, y, y_lengths):
+        y_mask = torch.unsqueeze(
+            commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
+        ge = self.ref_enc(y * y_mask, y_mask)
+
+        text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
+
+        z, m_q, logs_q = self.enc_q(y, y_lengths,ge)
+        z_p = self.flow(z, y_mask, g=ge)
+
+        attn = self.mas(z_p, m_t, logs_t, text_mask, y_mask)
+        x_mask = text_mask
+        w = attn.sum(2)
+        return w
+
+
+# if self.vq:
+#     x, codes, commit_loss, quantized_list = self.quantizer(x, layers=[0])
+# else:
+#     commit_loss = 0
+# if self.vq == True:
+#     npy = x.detach().cpu().numpy()
+#     npy = rearrange(npy, 'b c t-> (b t) c')
+#     _, I = index.search(npy, 1)
+#     npy = big_npy[I.squeeze()]
+#     npy = rearrange(npy, '(b t) c-> b c t',b=x.shape[0])
+#     feats = (torch.from_numpy(npy).to(x.device))
+#     x = x + (feats - x).detach()

@@ -16,7 +16,7 @@
     "if_save_every_weights":false,
     "if_save_latest":0,
     "lr_decay": 0.999875,
-    "batch_size" : 12,
+    "batch_size" : 8,
     "fp16_run" : false,
     "epochs" : 100,
     "pretrained_s2G" : "",
@@ -34,7 +34,8 @@
     "q_max" : 5,
     "num_peak" : 8,
     "g_min" : -12,
-    "g_max" : 12
+    "g_max" : 12,
+    "index_path" : "/home/hyc/tortoise_plus_zh/ttts/vqvae/added_IVF105_Flat_nprobe_1.index"
   },
   "dataset": {
     "pre":"~/tortoise_plus_zh",
@@ -87,6 +88,6 @@
     "use_spectral_norm": false,
     "gin_channels": 512,
     "semantic_frame_rate": "25hz",
-    "stage2":false
+    "vq":false
   }
 }

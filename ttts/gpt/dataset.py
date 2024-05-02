@@ -38,10 +38,11 @@ class GptTtsDataset(torch.utils.data.Dataset):
     def get_text_and_vq(self, audiopath_and_text):
         audiopath, text = audiopath_and_text['path'], audiopath_and_text['text']
         text = ' '.join(lazy_pinyin(text, style=Style.TONE3, neutral_tone_with_five=True))
+        text = ' '+text+' '
         text = self.tok.encode(text)
         text = LongTensor(text)
         # Fetch quantized MELs
-        quant_path = audiopath + '.vq.pth'
+        quant_path = audiopath + '.dur.pth'
         vq = LongTensor(torch.load(quant_path))
         return text, vq
     def get_wav_len(self, path):
@@ -68,7 +69,6 @@ class GptTtsDataset(torch.utils.data.Dataset):
             # Fetch text and add start/stop tokens.
             audiopath_and_text = self.audiopaths_and_text[index]
             text, vq = self.get_text_and_vq(audiopath_and_text)
-            vq = vq[1:-1]
             pths = self.audiopaths_and_text
             l = self.__len__()
             text_prepre, vq_prepre, prepre_wav_len = None,None,None

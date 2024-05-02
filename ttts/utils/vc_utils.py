@@ -11,7 +11,6 @@ import random
 import functools
 import math
 
-import librosa
 import numpy as np
 from scipy.io.wavfile import read
 import torch
