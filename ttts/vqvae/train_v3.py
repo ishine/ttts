@@ -246,7 +246,7 @@ class Trainer(object):
                     spec_aug = spectrogram_torch(wav_aug, self.hps.data.filter_length, self.hps.data.hop_length,
                                 self.hps.data.win_length, center=False).squeeze(0)
                     with self.accelerator.autocast():
-                        (y_hat, ids_slice, l_length, l_detail, z_mask,
+                        (y_hat, ids_slice, l_length, l_detail, l_text_detail, l_dur_detail, z_mask,
                             (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),
                             stats_ssl,) = self.G(spec, spec_aug, spec_length, text, text_length)
                         #  ssl, y, y_lengths, text, text_length
@@ -288,16 +288,20 @@ class Trainer(object):
                     self.D_optimizer.step()
                     accelerator.wait_for_everyone()
                     
-                    # unused_params =[]
-                    # G_ = self.accelerator.unwrap_model(self.G)
-                    # # unused_params.extend(list(G_.enc_p[-1].parameters()))
-                    # extraneous_addition = 0
-                    # for p in unused_params:
-                    #     extraneous_addition = extraneous_addition + p.mean()
+                    unused_params =[]
+                    G_ = self.accelerator.unwrap_model(self.G)
+                    unused_params.extend(list(G_.dur_detail_enc.parameters()))
+                    unused_params.extend(list(G_.dur_detail_emb.parameters()))
+                    unused_params.extend(list(G_.text_detail_enc.parameters()))
+                    extraneous_addition = 0
+                    for p in unused_params:
+                        extraneous_addition = extraneous_addition + p.mean()
                     # Generator
                     with self.accelerator.autocast():
                         y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.D(y, y_hat)
                     loss_detail = l_detail
+                    loss_text_detail = l_text_detail
+                    loss_dur_detail = l_dur_detail
                     loss_dur = torch.sum(l_length.float())
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * 45
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask)
@@ -305,8 +309,8 @@ class Trainer(object):
                     loss_fm = feature_loss(fmap_r, fmap_g)
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
                     loss_gen_all = loss_gen + loss_fm + loss_mel \
-                        + loss_kl + loss_kl_text + loss_dur + loss_detail
-                    # model = self.accelerator.unwrap_model(self.G)
+                        + loss_kl + loss_kl_text + loss_dur \
+                        + loss_detail + loss_text_detail + loss_dur_detail + extraneous_addition
 
                     self.G_optimizer.zero_grad()
                     self.accelerator.backward(loss_gen_all)
@@ -325,7 +329,8 @@ class Trainer(object):
                             eval_model.train()
                         scalar_dict = {"gen/loss_gen_all": loss_gen_all, "gen/loss_gen":loss_gen,
                             'gen/loss_fm':loss_fm,'gen/loss_mel':loss_mel,'gen/loss_dur':loss_dur,
-                            'gen/loss_detail':loss_detail,
+                            'gen/loss_detail':loss_detail, 'gen/loss_text_detail':loss_text_detail,
+                            'gen/loss_dur_detail':loss_dur_detail,
                             'gen/loss_kl':loss_kl, 'gen/loss_kl_text':loss_kl_text,"norm/G_grad": grad_norm_g, "norm/D_grad": grad_norm_d,
                             'disc/loss_disc_all':loss_disc_all,'gen/lr':lr}
                         image_dict = {
@@ -364,5 +369,5 @@ class Trainer(object):
 
 if __name__ == '__main__':
     trainer = Trainer()
-    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-01-11-57-50/model-75.pt')
+    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-03-13-24-48/model-44.pt')
     trainer.train()

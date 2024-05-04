@@ -4,6 +4,7 @@ logging.getLogger("h5py").setLevel(logging.INFO)
 logging.getLogger("numba").setLevel(logging.WARNING)
 from einops import rearrange, repeat
 import copy
+import numpy as np
 import time
 import torch.autograd.profiler as profiler
 import faiss
@@ -22,6 +23,42 @@ from ttts.vqvae.quantize import ResidualVectorQuantizer
 from ttts.utils.vc_utils import MultiHeadAttention
 from ttts.vqvae.alias_free_torch import *
 from ttts.vqvae import activations, monotonic_align
+
+def build_word_mask(x2word, y2word):
+    return (x2word[:, :, None] == y2word[:, None, :]).long()
+
+
+def mel2ph_to_mel2word(mel2ph, ph2word):
+    mel2word = (ph2word - 1).gather(1, (mel2ph - 1).clamp(min=0)) + 1
+    mel2word = mel2word * (mel2ph > 0).long()
+    return mel2word
+
+
+def clip_mel2token_to_multiple(mel2token, frames_multiple):
+    max_frames = mel2token.shape[1] // frames_multiple * frames_multiple
+    mel2token = mel2token[:, :max_frames]
+    return mel2token
+
+
+def expand_states(h, mel2token):
+    h = F.pad(h, [0, 0, 1, 0])
+    mel2token_ = mel2token[..., None].repeat([1, 1, h.shape[-1]])
+    h = torch.gather(h, 1, mel2token_)  # [B, T, H]
+    return h
+def group_hidden_by_segs(h, seg_ids, max_len):
+    """
+    :param h: [B, T, H]
+    :param seg_ids: [B, T]
+    :return: h_ph: [B, T_ph, H]
+    """
+    B, T, H = h.shape
+    h_gby_segs = h.new_zeros([B, max_len + 1, H]).scatter_add_(1, seg_ids[:, :, None].repeat([1, 1, H]), h)
+    all_ones = h.new_ones(h.shape[:2])
+    cnt_gby_segs = h.new_zeros([B, max_len + 1]).scatter_add_(1, seg_ids, all_ones).contiguous()
+    h_gby_segs = h_gby_segs[:, 1:]
+    cnt_gby_segs = cnt_gby_segs[:, 1:]
+    h_gby_segs = h_gby_segs / torch.clamp(cnt_gby_segs[:, :, None], min=1)
+    return h_gby_segs, cnt_gby_segs
 
 class MRTE(nn.Module):
     def __init__(
@@ -647,7 +684,7 @@ class SynthesizerTrn(nn.Module):
         n_speakers=0,
         gin_channels=0,
         semantic_frame_rate=None,
-        vq=False,
+        stage2=False,
         **kwargs
     ):
         super().__init__()
@@ -669,7 +706,7 @@ class SynthesizerTrn(nn.Module):
         self.n_speakers = n_speakers
         self.gin_channels = gin_channels
         self.mel_size = prosody_size
-        self.vq = vq
+        self.stage2 = stage2
 
         self.dec = Generator(
             inter_channels,
@@ -704,8 +741,19 @@ class SynthesizerTrn(nn.Module):
             latent_channels=192,
             gin_channels = gin_channels,
         )
+        self.text_detail_enc = SpecEncoder(
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            False,
+            n_heads,
+            4,
+            kernel_size,
+            p_dropout,
+            latent_channels=192,
+            gin_channels = gin_channels,
+        )
 
-        # self.mrte = MRTE()
         self.enc_p = []
         self.enc_p.extend(
             [
@@ -720,7 +768,6 @@ class SynthesizerTrn(nn.Module):
                 n_layers, kernel_size, p_dropout,gin_channels=gin_channels),
             ]
         )
-        self.quantizer = ResidualVectorQuantizer(dimension=inter_channels, n_q=1, bins=4096)
         self.enc_p = nn.ModuleList(self.enc_p)
         self.enc_q = PosteriorEncoder(
             spec_channels, inter_channels, hidden_channels, True,
@@ -731,12 +778,27 @@ class SynthesizerTrn(nn.Module):
         self.ref_enc = modules.MelStyleEncoder(
             spec_channels, style_vector_dim=gin_channels
         )
+        self.dur_detail_enc = SpecEncoder(
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            False,
+            n_heads,
+            2,
+            kernel_size,
+            p_dropout,
+            latent_channels=192,
+            gin_channels = gin_channels,
+        )
+        self.dur_detail_emb = nn.Embedding(4096, hidden_channels)
+        nn.init.normal_(self.dur_detail_emb.weight, 0.0, hidden_channels**-0.5)
         self.dp = DurationPredictor(
             hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
         )
-        self.sdp = StochasticDurationPredictor(
-            hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels
-        )
+        if self.stage2:
+            self.enc_q.requires_grad_(False)
+            self.t_enc.requires_grad_(False)
+            self.flow.requires_grad_(False)
     def mas(self,z_p,m_p,logs_p,x_mask,y_mask):
         with torch.no_grad():
             # negative cross-entropy
@@ -776,17 +838,37 @@ class SynthesizerTrn(nn.Module):
         x_mask = text_mask
         w = attn.sum(2)
 
-        l_length_sdp = self.sdp(text, x_mask, w, g=ge)
-        l_length_sdp = l_length_sdp / torch.sum(x_mask)
+        l_dur_detail = 0
+        if self.stage2:
+            durs = w.squeeze(1).long()
+            dur_detail = self.dur_detail_emb(durs).transpose(1,2)
+            dur_detail_ = self.dur_detail_enc(text.detach(), text_lengths, g=ge)
+            l_dur_detail = torch.sum(((dur_detail - dur_detail_) ** 2)*x_mask) / torch.sum(x_mask)
+            text = text + dur_detail
+
+        l_text_detail = 0
+        if self.stage2:
+            iota = torch.Tensor(range(1,text.shape[2]+1)).to(text.device)
+            mel2ph = torch.stack([F.pad(torch.repeat_interleave(iota,dur),
+                        (0,z_p.shape[2]-torch.sum(dur))) for dur in durs],dim=0).long()
+            text_detail, _ = group_hidden_by_segs(z_p.transpose(1,2), mel2ph, z_p.shape[2])
+            text_detail = text_detail.transpose(1,2)[:,:,:text.shape[2]]
+            text_detail_ = self.text_detail_enc(text.detach(),text_lengths, g=ge)
+            l_text_detail = torch.sum(((text_detail - text_detail_) ** 2)*x_mask) / torch.sum(x_mask)
+            text = text + text_detail
+
+        # l_length_sdp = self.sdp(text, x_mask, w, g=ge)
+        # l_length_sdp = l_length_sdp / torch.sum(x_mask)
         logw_ = torch.log(w + 1e-6) * x_mask
         logw = self.dp(text, x_mask, g=ge)
-        logw_sdp = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=1.0)
+        # logw_sdp = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=1.0)
         l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
             x_mask
         )  # for averaging
-        l_length_sdp += torch.sum((logw_sdp - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
+        # l_length_sdp += torch.sum((logw_sdp - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
 
-        l_length = l_length_dp + l_length_sdp
+        # l_length = l_length_dp + l_length_sdp
+        l_length = l_length_dp
 
         # expand prior
         m_t = torch.matmul(attn.squeeze(1), m_t.transpose(1, 2)).transpose(1, 2)
@@ -798,7 +880,7 @@ class SynthesizerTrn(nn.Module):
         detail = x
         detail_ = self.detail_enc(text, y_lengths, g=ge)
         l_detail = torch.sum(((detail - detail_) ** 2)*y_mask) / torch.sum(y_mask)
-        x = detail + text
+        x = text + detail
         x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
         quantized = x
 
@@ -811,23 +893,31 @@ class SynthesizerTrn(nn.Module):
             ids_slice,
             l_length,
             l_detail,
+            l_text_detail,
+            l_dur_detail,
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),
             quantized,
         )
 
 
-    def infer(self, y, y_lengths, text, text_lengths, refer, refer_lengths, noise_scale=0.667,sdp_ratio=0.2,noise_scale_w=0.8,length_scale=1.0):
+    def infer(self, y, y_lengths, text, text_lengths, refer, refer_lengths, noise_scale=0.667,sdp_ratio=0,noise_scale_w=0.8,length_scale=1.0):
         y_mask = torch.unsqueeze(
             commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
         ge = self.ref_enc(y * y_mask, y_mask)
 
         text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
         x_mask = text_mask
+        if self.stage2:
+            dur_detail = self.dur_detail_enc(text, text_lengths, g=ge)
+            text = text + dur_detail
+            text_detail = self.text_detail_enc(text, text_lengths, g=ge)
+            text = text + text_detail
 
-        logw = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=noise_scale_w) * (
-            sdp_ratio
-        ) + self.dp(text, x_mask, g=ge) * (1 - sdp_ratio)
+        # logw = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=noise_scale_w) * (
+        #     sdp_ratio
+        # ) + self.dp(text, x_mask, g=ge) * (1 - sdp_ratio)
+        logw = self.dp(text, x_mask, g=ge)
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
