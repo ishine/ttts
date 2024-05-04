@@ -741,18 +741,18 @@ class SynthesizerTrn(nn.Module):
             latent_channels=192,
             gin_channels = gin_channels,
         )
-        self.text_detail_enc = SpecEncoder(
-            inter_channels,
-            hidden_channels,
-            filter_channels,
-            False,
-            n_heads,
-            4,
-            kernel_size,
-            p_dropout,
-            latent_channels=192,
-            gin_channels = gin_channels,
-        )
+        # self.text_detail_enc = SpecEncoder(
+        #     inter_channels,
+        #     hidden_channels,
+        #     filter_channels,
+        #     False,
+        #     n_heads,
+        #     4,
+        #     kernel_size,
+        #     p_dropout,
+        #     latent_channels=192,
+        #     gin_channels = gin_channels,
+        # )
 
         self.enc_p = []
         self.enc_p.extend(
@@ -784,7 +784,7 @@ class SynthesizerTrn(nn.Module):
             filter_channels,
             False,
             n_heads,
-            2,
+            6,
             kernel_size,
             p_dropout,
             latent_channels=192,
@@ -795,10 +795,10 @@ class SynthesizerTrn(nn.Module):
         self.dp = DurationPredictor(
             hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
         )
-        if self.stage2:
-            self.enc_q.requires_grad_(False)
-            self.t_enc.requires_grad_(False)
-            self.flow.requires_grad_(False)
+        # if self.stage2:
+            # self.enc_q.requires_grad_(False)
+            # self.t_enc.requires_grad_(False)
+            # self.flow.requires_grad_(False)
     def mas(self,z_p,m_p,logs_p,x_mask,y_mask):
         with torch.no_grad():
             # negative cross-entropy
@@ -838,29 +838,26 @@ class SynthesizerTrn(nn.Module):
         x_mask = text_mask
         w = attn.sum(2)
 
-        l_dur_detail = 0
-        if self.stage2:
-            durs = w.squeeze(1).long()
-            dur_detail = self.dur_detail_emb(durs).transpose(1,2)
-            dur_detail_ = self.dur_detail_enc(text.detach(), text_lengths, g=ge)
-            l_dur_detail = torch.sum(((dur_detail - dur_detail_) ** 2)*x_mask) / torch.sum(x_mask)
-            text = text + dur_detail
+        durs = w.squeeze(1).long()
+        dur_detail = self.dur_detail_emb(durs).transpose(1,2)
+        dur_detail_ = self.dur_detail_enc(text.detach(), text_lengths, g=ge)
+        l_dur_detail = torch.sum(((dur_detail - dur_detail_) ** 2)*x_mask) / torch.sum(x_mask)
 
         l_text_detail = 0
-        if self.stage2:
-            iota = torch.Tensor(range(1,text.shape[2]+1)).to(text.device)
-            mel2ph = torch.stack([F.pad(torch.repeat_interleave(iota,dur),
-                        (0,z_p.shape[2]-torch.sum(dur))) for dur in durs],dim=0).long()
-            text_detail, _ = group_hidden_by_segs(z_p.transpose(1,2), mel2ph, z_p.shape[2])
-            text_detail = text_detail.transpose(1,2)[:,:,:text.shape[2]]
-            text_detail_ = self.text_detail_enc(text.detach(),text_lengths, g=ge)
-            l_text_detail = torch.sum(((text_detail - text_detail_) ** 2)*x_mask) / torch.sum(x_mask)
-            text = text + text_detail
+        # if self.stage2:
+        #     iota = torch.Tensor(range(1,text.shape[2]+1)).to(text.device)
+        #     mel2ph = torch.stack([F.pad(torch.repeat_interleave(iota,dur),
+        #                 (0,z_p.shape[2]-torch.sum(dur))) for dur in durs],dim=0).long()
+        #     text_detail, _ = group_hidden_by_segs(z_p.transpose(1,2), mel2ph, z_p.shape[2])
+        #     text_detail = text_detail.transpose(1,2)[:,:,:text.shape[2]]
+        #     text_detail_ = self.text_detail_enc(text.detach(),text_lengths, g=ge)
+        #     l_text_detail = torch.sum(((text_detail - text_detail_) ** 2)*x_mask) / torch.sum(x_mask)
+        #     text = text + text_detail
 
         # l_length_sdp = self.sdp(text, x_mask, w, g=ge)
         # l_length_sdp = l_length_sdp / torch.sum(x_mask)
         logw_ = torch.log(w + 1e-6) * x_mask
-        logw = self.dp(text, x_mask, g=ge)
+        logw = self.dp(text+dur_detail, x_mask, g=ge)
         # logw_sdp = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=1.0)
         l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
             x_mask
@@ -908,16 +905,15 @@ class SynthesizerTrn(nn.Module):
 
         text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
         x_mask = text_mask
-        if self.stage2:
-            dur_detail = self.dur_detail_enc(text, text_lengths, g=ge)
-            text = text + dur_detail
-            text_detail = self.text_detail_enc(text, text_lengths, g=ge)
-            text = text + text_detail
+        dur_detail = self.dur_detail_enc(text, text_lengths, g=ge)
+        # if self.stage2:
+            # text_detail = self.text_detail_enc(text, text_lengths, g=ge)
+            # text = text + text_detail
 
         # logw = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=noise_scale_w) * (
         #     sdp_ratio
         # ) + self.dp(text, x_mask, g=ge) * (1 - sdp_ratio)
-        logw = self.dp(text, x_mask, g=ge)
+        logw = self.dp(text+dur_detail, x_mask, g=ge)
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()

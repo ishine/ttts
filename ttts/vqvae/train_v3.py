@@ -292,7 +292,7 @@ class Trainer(object):
                     G_ = self.accelerator.unwrap_model(self.G)
                     unused_params.extend(list(G_.dur_detail_enc.parameters()))
                     unused_params.extend(list(G_.dur_detail_emb.parameters()))
-                    unused_params.extend(list(G_.text_detail_enc.parameters()))
+                    # unused_params.extend(list(G_.text_detail_enc.parameters()))
                     extraneous_addition = 0
                     for p in unused_params:
                         extraneous_addition = extraneous_addition + p.mean()
@@ -310,7 +310,7 @@ class Trainer(object):
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
                     loss_gen_all = loss_gen + loss_fm + loss_mel \
                         + loss_kl + loss_kl_text + loss_dur \
-                        + loss_detail + loss_text_detail + loss_dur_detail + extraneous_addition
+                        + loss_detail + loss_text_detail + loss_dur_detail + extraneous_addition*0
 
                     self.G_optimizer.zero_grad()
                     self.accelerator.backward(loss_gen_all)
@@ -369,5 +369,5 @@ class Trainer(object):
 
 if __name__ == '__main__':
     trainer = Trainer()
-    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-03-13-24-48/model-44.pt')
+    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-04-06-46-32/model-7.pt')
     trainer.train()
