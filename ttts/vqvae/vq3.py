@@ -900,10 +900,10 @@ class SynthesizerTrn(nn.Module):
         )
 
 
-    def infer(self, y, y_lengths, text, text_lengths, refer, refer_lengths, noise_scale=0.667,sdp_ratio=0,noise_scale_w=0.8,length_scale=1.0):
-        y_mask = torch.unsqueeze(
-            commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
-        ge = self.ref_enc(y * y_mask, y_mask)
+    def infer(self, text, text_lengths, refer, refer_lengths, noise_scale=0.667,sdp_ratio=0,noise_scale_w=0.8,length_scale=1.0):
+        refer_mask = torch.unsqueeze(
+            commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
+        ge = self.ref_enc(refer * refer_mask, refer_mask)
 
         text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
         x_mask = text_mask

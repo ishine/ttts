@@ -325,7 +325,7 @@ class Trainer(object):
                         with torch.no_grad():
                             eval_model = self.accelerator.unwrap_model(self.G)
                             eval_model.eval()
-                            wav_eval = eval_model.infer(spec, spec_length, text, text_length, spec, spec_length)
+                            wav_eval = eval_model.infer(text, text_length, spec, spec_length)
                             eval_model.train()
                         scalar_dict = {"gen/loss_gen_all": loss_gen_all, "gen/loss_gen":loss_gen,
                             'gen/loss_fm':loss_fm,'gen/loss_mel':loss_mel,'gen/loss_dur':loss_dur,
