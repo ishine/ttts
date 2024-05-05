@@ -915,7 +915,7 @@ class SynthesizerTrn(nn.Module):
         # logw = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=noise_scale_w) * (
         #     sdp_ratio
         # ) + self.dp(text, x_mask, g=ge) * (1 - sdp_ratio)
-        logw = self.dp(text+dur_detail, x_mask, g=ge)
+        logw = self.dp(text, x_mask, g=ge, dur_detail=dur_detail)
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
         y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
