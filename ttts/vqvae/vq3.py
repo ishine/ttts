@@ -640,11 +640,13 @@ class DurationPredictor(nn.Module):
         if gin_channels != 0:
             self.cond = nn.Conv1d(gin_channels, in_channels, 1)
 
-    def forward(self, x, x_mask, g=None):
+    def forward(self, x, x_mask, g=None, dur_detail=None):
         x = torch.detach(x)
         if g is not None:
             g = torch.detach(g)
             x = x + self.cond(g)
+        if dur_detail is not None:
+            x = x+dur_detail
         x = self.conv_1(x * x_mask)
         x = torch.relu(x)
         x = self.norm_1(x)
@@ -857,7 +859,7 @@ class SynthesizerTrn(nn.Module):
         # l_length_sdp = self.sdp(text, x_mask, w, g=ge)
         # l_length_sdp = l_length_sdp / torch.sum(x_mask)
         logw_ = torch.log(w + 1e-6) * x_mask
-        logw = self.dp(text+dur_detail, x_mask, g=ge)
+        logw = self.dp(text, x_mask, g=ge, dur_detail=dur_detail)
         # logw_sdp = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=1.0)
         l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
             x_mask
