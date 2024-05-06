@@ -6,7 +6,7 @@
 To the best of my knowledge, the method in this project is the first of its kind that I have proposed. The main idea stems from the modeling of 'detail', as I have been troubled by the fact that VQ (Vector Quantization) based methods cannot reconstruct audio very well, and there is also no way to model this residual. However, for traditional VITS, there are ways to create some supervisory signals, such as linear spectra, or by using learnable embeddings to learn the duration. These observations ultimately led to this method achieving very good results.
 
 # Demo
-Coming soon.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/adelacvg/ttts/blob/v4/demo.ipynb)
 
 # Install
 ```
@@ -23,6 +23,13 @@ Use the following instruction to train the model.
 ```
 accelerate launch ttts/vqvae/train_v3.py
 ```
+
+# Multi Language
+You can use any language with this model with two step.
+- First, collect many text of this language.
+- Second, train the `ttts/gpt/voice_tokenizer` to get a dictionary.
+
+For English, you can directly use the text. However, for Chinese, you need to use Pinyin, and for Japanese, you need to use Romaji, making sure to include pronunciation information in the text.
 
 # Inference
 
