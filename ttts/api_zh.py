@@ -5,11 +5,11 @@ import numpy as np
 from ttts.utils import vc_utils
 
 MODELS = {
-    'vqvae.pth':'/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-05-08-58-40/model-87.pt',
+    'vqvae.pth':'/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-05-08-58-40/model-144.pt',
 }
 from ttts.gpt.voice_tokenizer import VoiceBpeTokenizer
 import torch.nn.functional as F
-cond_audio = 'ttts/1.wav'
+cond_audio = 'ttts/3.wav'
 
 device = 'cuda:0'
 text = "大家好，今天来点大家想看的东西。"
