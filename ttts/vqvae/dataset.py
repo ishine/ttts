@@ -51,7 +51,7 @@ class VQGANDataset(torch.utils.data.Dataset):
                 filtered_paths.append(path)
                 lengths.append(size // (2 * self.hop_length))
                 filtered_texts.append(text)
-        self.tok = VoiceBpeTokenizer('ttts/gpt/gpt_tts_tokenizer.json')
+        self.tok = VoiceBpeTokenizer(hps.dataset.tokenizer)
         self.paths = filtered_paths
         self.texts = filtered_texts
         self.lengths = lengths
