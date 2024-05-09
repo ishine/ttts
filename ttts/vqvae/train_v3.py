@@ -370,5 +370,5 @@ class Trainer(object):
 if __name__ == '__main__':
     # trainer = Trainer(cfg_path='ttts/vqvae/config_v3.json')
     trainer = Trainer(cfg_path='ttts/vqvae/config_v3_en.json')
-    # trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-05-08-44-45/model-77.pt')
+    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-08-14-07-21/model-67.pt')
     trainer.train()

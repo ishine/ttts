@@ -1,4 +1,5 @@
 ttts/datasets/*
+ttts/data/*
 */**/*.pt
 */**/*.pyc
 */**/logs/*
@@ -13,5 +14,6 @@ damo/*
 .cache/*
 */**/*.wav
 */**/*.mp3
+*/**/*.7z
 !ttts/*.wav
 ast_indexer

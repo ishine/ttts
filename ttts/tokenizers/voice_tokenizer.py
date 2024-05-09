@@ -54,16 +54,16 @@ class VoiceBpeTokenizer:
         return txt
 
 
-def train():
-    with open('data/bpe_train-set.txt', 'r', encoding='utf-8') as at:
+def train(save_path):
+    with open('ttts/data/bpe_train-set.txt', 'r', encoding='utf-8') as at:
         ttsd = at.readlines()
     #bcd = datasets.load_dataset('bookcorpus', cache_dir='Z:\\huggingface_datasets\\cache')['train']
 
     #allowed_characters_re = re.compile(r'^[0-9a-z!@#%_=:;"/, \-\$\^&\*\(\)\+\{\[\]\}\\\.\'\?—–ʼ]+$')
-    allowed_characters_re = re.compile(r'^[0-9a-z!:;"/, \-\(\)\.\'\?ʼ，。？：；’‘”“、！…（）]+$')
+    allowed_characters_re = re.compile(r'^[\u3131-\uD79D0-9a-z!:~;."/, \-\(\)\.\'\?ʼ，。？：；’‘”“、！…（）」「《》]+$')
     def preprocess_word(word, report=False):
         # word = english_cleaners(word)
-        word = remove_extraneous_punctuation(word)
+        word = remove_extraneous_punctuation(word.lower())
         if not bool(allowed_characters_re.match(word)):
             if report and word:
                 print(f"REPORTING: '{word}'")
@@ -84,14 +84,12 @@ def train():
     tokenizer.pre_tokenizer = Whitespace()
     tokenizer.train_from_iterator(batch_iterator(), trainer, length=len(ttsd))#+len(bcd))
 
-    print(tokenizer.decode(tokenizer.encode("i was traveling throughhadslfghds the woods in 1235375t137{{}}").ids))
-
-    tokenizer.save('gpt/gpt_tts_tokenizer.json')
+    tokenizer.save(save_path)
 
 
-def test():
-    tok = VoiceBpeTokenizer('gpt/gpt_tts_tokenizer.json')
-    with open('data/bpe_train-set.txt', 'r', encoding='utf-8') as at:
+def test(tok_path):
+    tok = VoiceBpeTokenizer(tok_path)
+    with open('ttts/data/bpe_train-set.txt', 'r', encoding='utf-8') as at:
         ttsd = at.readlines()
         for line in ttsd:
             line = line.strip()
@@ -102,8 +100,7 @@ def test():
 
 
 if __name__ == '__main__':
-    '''
-    python script/all_text_to_one_file.py 
-    '''
-    # train()
-    test()
+    # train('ttts/tokenizers/jp_tokenizer.json')
+    # test('ttts/tokenizers/jp_tokenizer.json')
+    train('ttts/tokenizers/kr_tokenizer.json')
+    test('ttts/tokenizers/kr_tokenizer.json')

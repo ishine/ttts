@@ -47,7 +47,7 @@ class VQGANDataset(torch.utils.data.Dataset):
         for path,text in zip(self.paths,self.texts):
             size = os.path.getsize(path)
             duration = size / self.sampling_rate / 2
-            if duration < 15 and duration > 0.65:
+            if duration < 15 and duration > 1:
                 filtered_paths.append(path)
                 lengths.append(size // (2 * self.hop_length))
                 filtered_texts.append(text)
@@ -60,7 +60,7 @@ class VQGANDataset(torch.utils.data.Dataset):
         text = self.texts[index]
         text = ' '.join(lazy_pinyin(text, style=Style.TONE3, neutral_tone_with_five=True))
         text = ' '+text+' '
-        text = self.tok.encode(text)
+        text = self.tok.encode(text.lower())
         text = torch.LongTensor(text)
 
         wav_path = self.paths[index]

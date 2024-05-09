@@ -5,7 +5,7 @@ import numpy as np
 from ttts.utils import vc_utils
 
 MODELS = {
-    'vqvae.pth':'/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-05-08-58-40/model-144.pt',
+    'vqvae.pth':'/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-05-08-58-40/model-283.pt',
 }
 from ttts.gpt.voice_tokenizer import VoiceBpeTokenizer
 import torch.nn.functional as F
