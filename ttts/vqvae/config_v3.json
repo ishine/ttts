@@ -1,8 +1,8 @@
 {
   "train": {
-    "gpu_numbers":"4,5,6,7",
+    "gpu_numbers":"1,2",
     "train_steps":1000000,
-    "log_interval" : 100,
+    "val_freq": 100,
     "save_freq" : 1000,
     "keep_ckpts" : 3,
     "learning_rate":1e-4,
@@ -10,7 +10,6 @@
     "eps": 1e-09,
     "segment_size": 20480,
     "logs_folder":"ttts/vqvae/logs/v3",
-    "val_freq": 100,
     "seed": 1234,
     "save_every_epoch":1,
     "if_save_every_weights":false,
@@ -24,15 +23,15 @@
   },
   "dataset": {
     "pre":"~/tortoise_plus_zh",
-    "path":"ttts/datasets/44k_data.jsonl",
+    "path":"ttts/datasets/genshin_data_latin.jsonl",
     "pad_to_samples":200,
     "should_squeeze": true,
-    "tokenizer":"ttts/gpt/gpt_tts_tokenizer.json"
+    "lang": "ZH"
   },
   "dataloader":
   {
     "shuffle": true,
-    "num_workers" : 16,
+    "num_workers" : 6,
     "drop_last":true, 
     "pin_memory":true
   },
@@ -43,6 +42,7 @@
     "hop_length": 320,
     "win_length": 1024,
     "n_mel_channels": 128,
+    "prosody_channels":20,
     "mel_fmin": 0.0,
     "mel_fmax": null,
     "add_blank": true,
@@ -72,8 +72,6 @@
     ],
     "n_layers_q": 3,
     "use_spectral_norm": false,
-    "gin_channels": 512,
-    "semantic_frame_rate": "25hz",
-    "stage2":false
+    "gin_channels": 512
   }
 }

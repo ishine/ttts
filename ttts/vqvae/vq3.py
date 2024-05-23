@@ -7,7 +7,6 @@ import copy
 import numpy as np
 import time
 import torch.autograd.profiler as profiler
-import faiss
 import math
 import torch
 from torch import nn
@@ -16,13 +15,61 @@ from ttts.utils import commons
 from ttts.vqvae import modules, attentions
 
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
-from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
+from torch.nn.utils.parametrizations import weight_norm
+from torch.nn.utils import remove_weight_norm, spectral_norm
 from ttts.utils.commons import init_weights, get_padding
 from ttts.vqvae.modules import LinearNorm, Mish, Conv1dGLU
 from ttts.vqvae.quantize import ResidualVectorQuantizer
 from ttts.utils.vc_utils import MultiHeadAttention
 from ttts.vqvae.alias_free_torch import *
 from ttts.vqvae import activations, monotonic_align
+
+class LearnedPositionEmbeddings(nn.Module):
+    def __init__(self, seq_len, model_dim, init=.02):
+        super().__init__()
+        self.emb = nn.Embedding(seq_len, model_dim)
+        # Initializing this way is standard for GPT-2
+        self.emb.weight.data.normal_(mean=0.0, std=init)
+
+    def forward(self, x):
+        sl = x.shape[1]
+        return self.emb(torch.arange(0, sl, device=x.device))
+
+    def get_fixed_embedding(self, ind, dev):
+        return self.emb(torch.tensor([ind], device=dev)).unsqueeze(0)
+class MRTE(nn.Module):
+    def __init__(
+        self,
+        text_channels=192,
+        spec_channels=513,
+        hidden_size=512,
+        out_channels=192,
+        kernel_size=5,
+        n_heads=4,
+        ge_layer=2,
+    ):
+        super(MRTE, self).__init__()
+        self.cross_attention = MultiHeadAttention(hidden_size, hidden_size, n_heads)
+        self.c_pre = nn.Conv1d(text_channels, hidden_size, 1)
+        self.spec_pre = nn.Conv1d(spec_channels, hidden_size, 1)
+        self.c_post = nn.Conv1d(hidden_size, out_channels, 1)
+
+    def forward(self, text, text_mask, spec, spec_mask, ge):
+        if ge == None:
+            ge = 0
+        attn_mask = spec_mask.unsqueeze(2) * text_mask.unsqueeze(-1)
+
+        text_enc = self.c_pre(text * text_mask)
+        spec_enc = self.spec_pre(spec * spec_mask)
+        x = (
+            self.cross_attention(
+                text_enc * text_mask, spec_enc * spec_mask, attn_mask
+            )
+            + text_enc
+            + ge
+        )
+        x = self.c_post(x * text_mask)
+        return x
 
 def build_word_mask(x2word, y2word):
     return (x2word[:, :, None] == y2word[:, None, :]).long()
@@ -60,41 +107,6 @@ def group_hidden_by_segs(h, seg_ids, max_len):
     h_gby_segs = h_gby_segs / torch.clamp(cnt_gby_segs[:, :, None], min=1)
     return h_gby_segs, cnt_gby_segs
 
-class MRTE(nn.Module):
-    def __init__(
-        self,
-        content_enc_channels=192,
-        hidden_size=512,
-        out_channels=192,
-        kernel_size=5,
-        n_heads=4,
-        ge_layer=2,
-    ):
-        super(MRTE, self).__init__()
-        # self.cross_attention = MultiHeadAttention(hidden_size, hidden_size, n_heads)
-        self.c_pre = nn.Conv1d(content_enc_channels, hidden_size, 1)
-        self.text_pre = nn.Conv1d(content_enc_channels, hidden_size, 1)
-        self.c_post = nn.Conv1d(hidden_size, out_channels, 1)
-
-    def forward(self, ssl_enc, ssl_mask, text, text_mask, ge):
-        if ge == None:
-            ge = 0
-        attn_mask = text_mask.unsqueeze(2) * ssl_mask.unsqueeze(-1)
-
-        ssl_enc = self.c_pre(ssl_enc * ssl_mask)
-        text_enc = self.text_pre(text * text_mask)
-    
-        x = (
-            # self.cross_attention(
-            #     ssl_enc * ssl_mask, text_enc * text_mask, attn_mask
-            # )
-            text_enc
-            + ssl_enc
-            + ge
-        )
-        x = self.c_post(x * ssl_mask)
-        return x
-
 class TextEncoder(nn.Module):
     def __init__(
         self,
@@ -127,15 +139,16 @@ class TextEncoder(nn.Module):
             kernel_size,
             p_dropout,
         )
-        self.text_embedding = nn.Embedding(256, hidden_channels)
+        self.text_embedding = nn.Embedding(4096, hidden_channels)
         nn.init.normal_(self.text_embedding.weight, 0.0, hidden_channels**-0.5)
         self.proj = nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
-    def forward(self, text=None, text_lengths=None):
+    def forward(self, text, text_lengths):
         text_mask = torch.unsqueeze(
             commons.sequence_mask(text_lengths, text.size(1)), 1
         ).to(text.dtype)
-        text = self.text_embedding(text).transpose(1, 2)
+        text = self.text_embedding(text)
+        text = text.transpose(1, 2)
         text = self.encoder(text * text_mask, text_mask)
         # return text, text_mask
         stats = self.proj(text) * text_mask
@@ -682,11 +695,10 @@ class SynthesizerTrn(nn.Module):
         upsample_rates,
         upsample_initial_channel,
         upsample_kernel_sizes,
-        prosody_size=20,
+        prosody_channels=20,
         n_speakers=0,
         gin_channels=0,
         semantic_frame_rate=None,
-        stage2=False,
         **kwargs
     ):
         super().__init__()
@@ -707,8 +719,6 @@ class SynthesizerTrn(nn.Module):
         self.segment_size = segment_size
         self.n_speakers = n_speakers
         self.gin_channels = gin_channels
-        self.mel_size = prosody_size
-        self.stage2 = stage2
 
         self.dec = Generator(
             inter_channels,
@@ -753,14 +763,13 @@ class SynthesizerTrn(nn.Module):
         #     kernel_size,
         #     p_dropout,
         #     latent_channels=192,
-        #     gin_channels = gin_channels,
         # )
 
         self.enc_p = []
         self.enc_p.extend(
             [
                 PosteriorEncoder(
-                    spec_channels, inter_channels, hidden_channels, False,
+                    prosody_channels, inter_channels, hidden_channels, False,
                 5, 1, 16, gin_channels=gin_channels),
                 SpecEncoder(
                     inter_channels, hidden_channels, filter_channels, False, n_heads,
@@ -797,10 +806,6 @@ class SynthesizerTrn(nn.Module):
         self.dp = DurationPredictor(
             hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
         )
-        # if self.stage2:
-            # self.enc_q.requires_grad_(False)
-            # self.t_enc.requires_grad_(False)
-            # self.flow.requires_grad_(False)
     def mas(self,z_p,m_p,logs_p,x_mask,y_mask):
         with torch.no_grad():
             # negative cross-entropy
@@ -825,11 +830,10 @@ class SynthesizerTrn(nn.Module):
                 .detach()
             )
         return attn
-    def forward(self, y, y_aug, y_lengths, text, text_lengths):
+    def forward(self, y, y_lengths, text, text_lengths, prosody):
         y_mask = torch.unsqueeze(
             commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
         ge = self.ref_enc(y * y_mask, y_mask)
-        ge_aug = self.ref_enc(y_aug * y_mask,y_mask)
 
         text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
 
@@ -840,33 +844,17 @@ class SynthesizerTrn(nn.Module):
         x_mask = text_mask
         w = attn.sum(2)
 
+        l_text_detail = 0
         durs = w.squeeze(1).long()
         dur_detail = self.dur_detail_emb(durs).transpose(1,2)
         dur_detail_ = self.dur_detail_enc(text.detach(), text_lengths, g=ge)
         l_dur_detail = torch.sum(((dur_detail - dur_detail_) ** 2)*x_mask) / torch.sum(x_mask)
 
-        l_text_detail = 0
-        # if self.stage2:
-        #     iota = torch.Tensor(range(1,text.shape[2]+1)).to(text.device)
-        #     mel2ph = torch.stack([F.pad(torch.repeat_interleave(iota,dur),
-        #                 (0,z_p.shape[2]-torch.sum(dur))) for dur in durs],dim=0).long()
-        #     text_detail, _ = group_hidden_by_segs(z_p.transpose(1,2), mel2ph, z_p.shape[2])
-        #     text_detail = text_detail.transpose(1,2)[:,:,:text.shape[2]]
-        #     text_detail_ = self.text_detail_enc(text.detach(),text_lengths, g=ge)
-        #     l_text_detail = torch.sum(((text_detail - text_detail_) ** 2)*x_mask) / torch.sum(x_mask)
-        #     text = text + text_detail
-
-        # l_length_sdp = self.sdp(text, x_mask, w, g=ge)
-        # l_length_sdp = l_length_sdp / torch.sum(x_mask)
         logw_ = torch.log(w + 1e-6) * x_mask
         logw = self.dp(text, x_mask, g=ge, dur_detail=dur_detail)
-        # logw_sdp = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=1.0)
         l_length_dp = torch.sum((logw - logw_) ** 2, [1, 2]) / torch.sum(
             x_mask
         )  # for averaging
-        # l_length_sdp += torch.sum((logw_sdp - logw_) ** 2, [1, 2]) / torch.sum(x_mask)
-
-        # l_length = l_length_dp + l_length_sdp
         l_length = l_length_dp
 
         # expand prior
@@ -874,8 +862,8 @@ class SynthesizerTrn(nn.Module):
         logs_t = torch.matmul(attn.squeeze(1), logs_t.transpose(1, 2)).transpose(1, 2)
         text =  torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1, 2)
 
-        x = self.enc_p[0](y_aug, y_lengths, g=ge_aug)
-        x = self.enc_p[1](x, y_lengths, g=ge_aug)
+        x = self.enc_p[0](prosody, y_lengths, g=ge)
+        x = self.enc_p[1](x, y_lengths, g=ge)
         detail = x
         detail_ = self.detail_enc(text, y_lengths, g=ge)
         l_detail = torch.sum(((detail - detail_) ** 2)*y_mask) / torch.sum(y_mask)
@@ -904,17 +892,10 @@ class SynthesizerTrn(nn.Module):
         refer_mask = torch.unsqueeze(
             commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
         ge = self.ref_enc(refer * refer_mask, refer_mask)
-
         text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
         x_mask = text_mask
         dur_detail = self.dur_detail_enc(text, text_lengths, g=ge)
-        # if self.stage2:
-            # text_detail = self.text_detail_enc(text, text_lengths, g=ge)
-            # text = text + text_detail
 
-        # logw = self.sdp(text, x_mask, g=ge, reverse=True, noise_scale=noise_scale_w) * (
-        #     sdp_ratio
-        # ) + self.dp(text, x_mask, g=ge) * (1 - sdp_ratio)
         logw = self.dp(text, x_mask, g=ge, dur_detail=dur_detail)
         w = torch.exp(logw) * x_mask * length_scale
         w_ceil = torch.ceil(w)
@@ -935,85 +916,17 @@ class SynthesizerTrn(nn.Module):
         o = self.dec(z, g=ge)
         return  o
 
-    def infer_ar(self, y, y_lengths, text, text_lengths, refer, refer_lengths,  big_npy=None, index=None, noise_scale=0.667,sdp_ratio=0,noise_scale_w=0.8,length_scale=1.0):
-        y_mask = torch.unsqueeze(
-            commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
-        ge = self.ref_enc(y * y_mask, y_mask)
-
-        text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
-
-        z, m_q, logs_q = self.enc_q(y, y_lengths,ge)
-        z_p = self.flow(z, y_mask, g=ge)
-
-        attn = self.mas(z_p, m_t, logs_t, text_mask, y_mask)
-        x_mask = text_mask
-        w = attn.sum(2)
-
-        y_lengths = torch.clamp_min(torch.sum(w, [1, 2]), 1).long()
-        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
-            x_mask.dtype
-        )
-        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-        attn = commons.generate_path(w, attn_mask).float()
-        text = torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1,2)
-
-        detail = self.detail_enc(text, y_lengths, g=ge)
-        x = detail + text
-        x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
-
-        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
-        z = self.flow(z_p, y_mask, g=ge, reverse=True)
-        o = self.dec(z, g=ge)
-        return  o
-    @torch.no_grad()
-    def decode(self, text, text_lengths, refer, refer_lengths, dur, noise_scale=0.5):
+    def vc(self, source, source_lengths, refer, refer_lengths, length_scale=1.0):
         refer_mask = torch.unsqueeze(
             commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
-        ge = self.ref_enc(refer * refer_mask, refer_mask)
-        text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
-        x_mask = text_mask
-        w = dur
-        y_lengths = torch.clamp_min(torch.sum(w, [1, 2]), 1).long()
-        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(
-            x_mask.dtype
-        )
-        attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-        attn = commons.generate_path(w, attn_mask).float()
-        text = torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1,2)
+        source_mask = torch.unsqueeze(
+            commons.sequence_mask(source_lengths, source.size(2)), 1).to(source.dtype)
+        ge_ref = self.ref_enc(refer * refer_mask, refer_mask)
+        ge_src = self.ref_enc(source * source_mask, source_mask)
 
-        detail = self.detail_enc(text, y_lengths, g=ge)
-        x = detail + text
-        x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
+        z, m_q, logs_q = self.enc_q(source, source_lengths,ge_src)
+        z_p = self.flow(z, source_mask, g=ge_src)
 
-        z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
-        z = self.flow(z_p, y_mask, g=ge, reverse=True)
-        o = self.dec(z, g=ge)
+        z = self.flow(z_p, source_mask, g=ge_ref, reverse=True)
+        o = self.dec(z, g=ge_ref)
         return  o
-    def extract_dur(self, text, text_lengths, y, y_lengths):
-        y_mask = torch.unsqueeze(
-            commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
-        ge = self.ref_enc(y * y_mask, y_mask)
-
-        text, m_t, logs_t, text_mask = self.t_enc(text, text_lengths)
-
-        z, m_q, logs_q = self.enc_q(y, y_lengths,ge)
-        z_p = self.flow(z, y_mask, g=ge)
-
-        attn = self.mas(z_p, m_t, logs_t, text_mask, y_mask)
-        x_mask = text_mask
-        w = attn.sum(2)
-        return w
-
-
-# if self.vq:
-#     x, codes, commit_loss, quantized_list = self.quantizer(x, layers=[0])
-# else:
-#     commit_loss = 0
-# if self.vq == True:
-#     npy = x.detach().cpu().numpy()
-#     npy = rearrange(npy, 'b c t-> (b t) c')
-#     _, I = index.search(npy, 1)
-#     npy = big_npy[I.squeeze()]
-#     npy = rearrange(npy, '(b t) c-> b c t',b=x.shape[0])
-#     feats = (torch.from_numpy(npy).to(x.device))
-#     x = x + (feats - x).detach()

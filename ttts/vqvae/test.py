@@ -1,15 +1,25 @@
-from ttts.vqvae.augment import Augment
-import torchaudio.functional as AuF
-import torchaudio
-import json
-from ttts.utils.data_utils import HParams
-from typing import List, Optional, Tuple, Union
-import torch
-from ttts.utils.infer_utils import load_model
-from ttts.utils.data_utils import spec_to_mel_torch, mel_spectrogram_torch, HParams, spectrogram_torch
-from ttts.gpt.voice_tokenizer import VoiceBpeTokenizer
-from pypinyin import lazy_pinyin, Style
-import torch.nn.functional as F
+# from ttts.vqvae.augment import Augment
+# import torchaudio.functional as AuF
+# import torchaudio
+# import json
+# from ttts.utils.data_utils import HParams
+# from typing import List, Optional, Tuple, Union
+# import torch
+# from ttts.utils.infer_utils import load_model
+# from ttts.utils.data_utils import spec_to_mel_torch, mel_spectrogram_torch, HParams, spectrogram_torch
+# from ttts.gpt.voice_tokenizer import VoiceBpeTokenizer
+# from pypinyin import lazy_pinyin, Style
+# import torch.nn.functional as F
+# from polyglot.detect import Detector
+
+# # text = '你好'
+# text = 'hello'
+# # text = 'お前らの親分はどいつだ？前に出てこい！'
+# # text = '너희 셋 중에 누가 대장이야? 나와!'
+# # text = '.....'
+# language= Detector(text).languages[0]
+# print(language.name)
+
 # device = 'cuda:0'
 # vqvae_path = '/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-04-24-05-25-41/model-61.pt'
 # model = load_model('vqvae', vqvae_path, 'ttts/vqvae/config_v3.json', device)

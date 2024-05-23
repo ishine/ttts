@@ -4,7 +4,6 @@ logging.getLogger("h5py").setLevel(logging.INFO)
 logging.getLogger("numba").setLevel(logging.WARNING)
 import copy
 import random
-import faiss
 import time
 from datetime import datetime
 import json
@@ -32,6 +31,11 @@ from ttts.vqvae.hifigan import MultiPeriodDiscriminator
 from ttts.vqvae.augment import Augment
 from torchaudio.functional import phase_vocoder, resample, spectrogram
 from torch_pitch_shift import pitch_shift
+from torchaudio import transforms
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = False
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 def set_requires_grad(model, val):
     for p in model.parameters():
         p.requires_grad = val
@@ -72,58 +76,6 @@ def clip_grad_value_(parameters, clip_value, norm_type=2):
             p.grad.data.clamp_(min=-clip_value, max=clip_value)
     total_norm = total_norm ** (1.0 / norm_type)
     return total_norm
-def Perturbing(
-    audios: torch.FloatTensor,
-    sample_rate: int= 32000,
-    f0_perturbation_factor_min: int= -6,
-    f0_perturbation_factor_max: int= 6,
-    pes_low_cutoff: int= 60,
-    pes_high_cutoff: int= 10000,
-    pes_q_min: float= 2.0,
-    pes_q_max: float= 5.0,
-    gain_min: float= -12.0,
-    gain_max: float= 12.0,
-    ):
-    step = random.choice([-17,-15,-14,-8,-4,7,8,12,13])
-    try:
-        audios = torchaudio.functional.pitch_shift(
-            audios.unsqueeze(1),
-            sample_rate= sample_rate,
-            n_steps= step,
-            bins_per_octave=12,
-            ).squeeze(1)
-    except Exception as e:
-        print(step)
-        print(e)
-    with torch.cuda.amp.autocast(enabled= False):   # equalizer_biquad does not support fp16
-        audios = audios.float()
-        cutoff_frequency_hls = torch.tensor(min(pes_low_cutoff // 2, sample_rate // 2)).to(audios.device)
-        cutoff_frequency_hhs = torch.tensor(min(pes_high_cutoff // 2, sample_rate // 2)).to(audios.device) # when over sample_rate // 2, audio is broken.
-        num_peaking_filters = 8
-        frequencies_peak = torch.logspace(cutoff_frequency_hls.log10(), cutoff_frequency_hhs.log10(), num_peaking_filters + 2)[1:-1]
-
-        audios = torchaudio.functional.equalizer_biquad(
-            waveform= audios,
-            sample_rate= sample_rate,
-            center_freq= cutoff_frequency_hhs,
-            gain= 0.0
-            )
-        audios = torchaudio.functional.equalizer_biquad(
-            waveform= audios,
-            sample_rate= sample_rate,
-            center_freq= cutoff_frequency_hls,
-            gain= 0.0
-            )
-        for x in frequencies_peak:
-            audios = torchaudio.functional.equalizer_biquad(
-            waveform= audios,
-            sample_rate= sample_rate,
-            center_freq= x,
-            gain= (gain_max - gain_min) * torch.rand(1) + gain_min,
-            Q= pes_q_min * (pes_q_max - pes_q_min) ** torch.rand(1)
-            )
-
-    return audios
 from accelerate import DistributedDataParallelKwargs
 class Trainer(object):
     def __init__(self, cfg_path='ttts/vqvae/config_v3.json'):
@@ -145,12 +97,12 @@ class Trainer(object):
         collate_fn=VQVAECollater()
         self.dataloader = DataLoader(
             dataset,
-            # batch_size=hps.train.batch_size,
-            num_workers=8,
+            batch_size=hps.train.batch_size,
+            num_workers=hps.dataloader.num_workers,
             shuffle=False,
             pin_memory=True,
             collate_fn=collate_fn,
-            batch_sampler=train_sampler,
+            # batch_sampler=train_sampler,
             persistent_workers=True,
             prefetch_factor=16,)
         self.train_steps = self.cfg['train']['train_steps']
@@ -219,6 +171,7 @@ class Trainer(object):
         accelerator = self.accelerator
         device = accelerator.device
         hps = self.hps
+        cnt=0
 
         if accelerator.is_main_process:
             writer = SummaryWriter(log_dir=self.logs_folder)
@@ -239,16 +192,15 @@ class Trainer(object):
                     text_length = data['text_lengths'].to(device)
                     spec = spectrogram_torch(wav, self.hps.data.filter_length,
                         self.hps.data.hop_length, self.hps.data.win_length, center=False).squeeze(0)
+                    prosody = mel_spectrogram_torch(
+                            wav, hps.data.filter_length, hps.data.prosody_channels, hps.data.sampling_rate, hps.data.hop_length,
+                            hps.data.win_length, hps.data.mel_fmin, hps.data.mel_fmax)
                     spec_length = torch.LongTensor([
                         x//self.hps.data.hop_length for x in wav_length]).to(device)
-                    # wav_aug = Perturbing(wav)
-                    wav_aug = wav
-                    spec_aug = spectrogram_torch(wav_aug, self.hps.data.filter_length, self.hps.data.hop_length,
-                                self.hps.data.win_length, center=False).squeeze(0)
                     with self.accelerator.autocast():
                         (y_hat, ids_slice, l_length, l_detail, l_text_detail, l_dur_detail, z_mask,
                             (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),
-                            stats_ssl,) = self.G(spec, spec_aug, spec_length, text, text_length)
+                            stats_ssl,) = self.G(spec, spec_length, text, text_length, prosody)
                         #  ssl, y, y_lengths, text, text_length
                         mel = spec_to_mel_torch(
                             spec,
@@ -314,6 +266,7 @@ class Trainer(object):
 
                     self.G_optimizer.zero_grad()
                     self.accelerator.backward(loss_gen_all)
+
                     grad_norm_g = commons.clip_grad_value_(self.G.parameters(), None)
                     get_grad_norm(self.G)
                     accelerator.wait_for_everyone()
@@ -322,37 +275,46 @@ class Trainer(object):
                     pbar.set_description(f'G_loss:{loss_gen_all:.4f} D_loss:{loss_disc_all:.4f}')
                     if accelerator.is_main_process and self.step % self.val_freq == 0:
                         lr = self.G_optimizer.param_groups[0]["lr"]
+                        eval_model = self.accelerator.unwrap_model(self.G)
+                        eval_model.eval()
                         with torch.no_grad():
-                            eval_model = self.accelerator.unwrap_model(self.G)
-                            eval_model.eval()
                             wav_eval = eval_model.infer(text, text_length, spec, spec_length)
-                            eval_model.train()
-                        scalar_dict = {"gen/loss_gen_all": loss_gen_all, "gen/loss_gen":loss_gen,
-                            'gen/loss_fm':loss_fm,'gen/loss_mel':loss_mel,'gen/loss_dur':loss_dur,
-                            'gen/loss_detail':loss_detail, 'gen/loss_text_detail':loss_text_detail,
-                            'gen/loss_dur_detail':loss_dur_detail,
-                            'gen/loss_kl':loss_kl, 'gen/loss_kl_text':loss_kl_text,"norm/G_grad": grad_norm_g, "norm/D_grad": grad_norm_d,
-                            'disc/loss_disc_all':loss_disc_all,'gen/lr':lr}
+                        eval_model.train()
+                        scalar_dict = {
+                                "gen/loss_gen_all": loss_gen_all,
+                                "gen/loss_gen":loss_gen,
+                                'gen/loss_fm':loss_fm,
+                                'gen/loss_mel':loss_mel,
+                                'gen/loss_dur':loss_dur,
+                                'gen/loss_detail':loss_detail, 
+                                'gen/loss_text_detail':loss_text_detail,
+                                'gen/loss_dur_detail':loss_dur_detail,
+                                'gen/loss_kl':loss_kl, 
+                                'gen/loss_kl_text':loss_kl_text,
+                                "norm/G_grad": grad_norm_g, 
+                                "norm/D_grad": grad_norm_d,
+                                'disc/loss_disc_all':loss_disc_all,
+                                'gen/lr':lr,
+                            }
                         image_dict = {
-                            "img/mel": plot_spectrogram_to_numpy(y_mel[0, :, :].detach().unsqueeze(-1).cpu()),
-                            "img/mel_pred": plot_spectrogram_to_numpy(y_hat_mel[0, :, :].detach().unsqueeze(-1).cpu()),
+                            "img/mel": plot_spectrogram_to_numpy(y_mel[0, :, :].detach().unsqueeze(-1).cpu().numpy()),
+                            "img/mel_pred": plot_spectrogram_to_numpy(y_hat_mel[0, :, :].detach().unsqueeze(-1).cpu().numpy()),
                             "img/mel_raw": plot_spectrogram_to_numpy( mel[0].data.cpu().numpy()),
                             "img/stats_ssl": plot_spectrogram_to_numpy(stats_ssl[0].data.cpu().numpy()),
                         }
                         audios_dict = {
                             'wav/gt':wav[0].detach().cpu(),
-                            'wav/pert':wav_aug[0].detach().cpu(),
                             'wav/pred':wav_eval[0].detach().cpu()
                         }
                         milestone = self.step // self.cfg['train']['save_freq'] 
-                        torchaudio.save(str(self.logs_folder / f'sample-{milestone}.wav'), wav_eval[0].detach().cpu(), 32000)
+                        torchaudio.save(str(self.logs_folder / f'sample-{milestone}.wav'), wav_eval[0].detach().cpu(), hps.data.sampling_rate)
                         summarize(
                             writer=writer,
                             global_step=self.step,
                             images=image_dict,
                             audios=audios_dict,
                             scalars=scalar_dict,
-                            audio_sampling_rate=32000
+                            audio_sampling_rate=hps.data.sampling_rate
                         )
                     if accelerator.is_main_process and self.step % self.cfg['train']['save_freq']==0:
                         keep_ckpts = self.cfg['train']['keep_ckpts']
@@ -368,7 +330,6 @@ class Trainer(object):
 
 
 if __name__ == '__main__':
-    # trainer = Trainer(cfg_path='ttts/vqvae/config_v3.json')
-    trainer = Trainer(cfg_path='ttts/vqvae/config_v3_en.json')
-    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-08-14-07-21/model-67.pt')
+    trainer = Trainer(cfg_path='ttts/vqvae/config_v3.json')
+    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-23-08-45-13/model-30.pt')
     trainer.train()

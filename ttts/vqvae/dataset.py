@@ -22,6 +22,11 @@ import wave
 import logging
 import subprocess
 from glob import glob
+import cutlet
+from hangul_romanize import Transliter
+from hangul_romanize.rule import academic
+from polyglot.detect.base import logger as polyglot_logger
+polyglot_logger.setLevel("ERROR")
 numba_logger = logging.getLogger('numba')
 numba_logger.setLevel(logging.ERROR)
 
@@ -30,13 +35,16 @@ def get_duration(in_audio):
     return float(result.stdout)
 
 class VQGANDataset(torch.utils.data.Dataset):
-
     def __init__(self, hps):
         paths = read_jsonl(hps.dataset.path)
         pre = os.path.expanduser(hps.dataset.pre)
         # self.paths = glob(os.path.join(hps.dataset.path, "**/*.wav"), recursive=True)
         self.paths = [os.path.join(pre,d['path']) for d in paths]
         self.texts = [d['text'] for d in paths]
+        self.langs = [d['lang'] for d in paths]
+        self.latins = [d['latin'] for d in paths]
+        wav_lengths = [d['wav_length'] for d in paths]
+        srs = [d['sr'] for d in paths]
         self.hop_length = hps.data.hop_length
         self.win_length = hps.data.win_length
         self.sampling_rate = hps.data.sampling_rate
@@ -44,34 +52,67 @@ class VQGANDataset(torch.utils.data.Dataset):
         filtered_paths = []
         lengths=[]
         filtered_texts = []
-        for path,text in zip(self.paths,self.texts):
-            size = os.path.getsize(path)
-            duration = size / self.sampling_rate / 2
-            if duration < 15 and duration > 1:
+        filtered_langs = []
+        filtered_latins = []
+        for path,text,lang,latin,wav_length,sr in zip(
+            self.paths,self.texts,self.langs,self.latins,wav_lengths,srs):
+            duration = wav_length/sr
+            if duration < 10 and duration > 1 and lang==hps.dataset.lang:
                 filtered_paths.append(path)
-                lengths.append(size // (2 * self.hop_length))
+                lengths.append(duration*16000//self.hop_length)
                 filtered_texts.append(text)
-        self.tok = VoiceBpeTokenizer(hps.dataset.tokenizer)
+                filtered_langs.append(lang)
+                filtered_latins.append(latin)
+        self.tok_zh = VoiceBpeTokenizer('ttts/tokenizers/zh_tokenizer.json')
+        self.tok_en = VoiceBpeTokenizer('ttts/tokenizers/en_tokenizer.json')
+        self.tok_jp = VoiceBpeTokenizer('ttts/tokenizers/jp_tokenizer.json')
+        self.tok_kr = VoiceBpeTokenizer('ttts/tokenizers/kr_tokenizer.json')
         self.paths = filtered_paths
         self.texts = filtered_texts
+        self.langs = filtered_langs
+        self.latins = filtered_latins
         self.lengths = lengths
 
     def __getitem__(self, index):
-        text = self.texts[index]
-        text = ' '.join(lazy_pinyin(text, style=Style.TONE3, neutral_tone_with_five=True))
-        text = ' '+text+' '
-        text = self.tok.encode(text.lower())
+        text = self.latins[index]
+        lang = self.langs[index]
+        if lang == "ZH":
+            text = self.tok_zh.encode(text.lower())
+        elif lang == "JP":
+            text = self.tok_jp.encode(text.lower())
+        elif lang == "EN":
+            text = self.tok_en.encode(text.lower())
+        elif lang == "KR":
+            text = self.tok_kr.encode(text.lower())
+        else:
+            return None
         text = torch.LongTensor(text)
+        if lang == "ZH":
+            text = text + 256*0
+            lang = 0
+        elif lang == "JP":
+            text = text + 256*1
+            lang = 1
+        elif lang == "EN":
+            text = text + 256*2
+            lang = 2
+        elif lang == "KR":
+            text = text + 256*3
+            lang = 3
+        else:
+            return None
 
         wav_path = self.paths[index]
         wav, sr = torchaudio.load(wav_path)
         if wav.shape[0] > 1:
             wav = wav[0].unsqueeze(0)
-        wav32k = AuF.resample(wav, sr, 32000)
-        wav32k = wav32k[:,:int(self.hop_length * (wav32k.shape[-1]//self.hop_length))]
-        wav32k = torch.clamp(wav32k, min=-1.0, max=1.0)
-        # text = torch.Tensor([0])
-        return  wav32k, text
+        wav = AuF.resample(wav, sr, self.sampling_rate)
+        wav = wav[:,:int(self.hop_length * (wav.shape[-1]//self.hop_length))]
+        wav = torch.clamp(wav, min=-1.0, max=1.0)
+        if wav.shape[-1]<30000:
+            return None
+        assert wav.shape[-1]>20480
+        return  wav, text, lang
 
     def __len__(self):
         return len(self.paths)
@@ -81,6 +122,7 @@ class VQVAECollater():
         pass
     def __call__(self, batch):
         batch = [x for x in batch if x is not None]
+        assert len(batch) > 1
         _, ids_sorted_decreasing = torch.sort(
             torch.LongTensor([x[0].size(-1) for x in batch]),
             dim=0, descending=True)
@@ -89,6 +131,7 @@ class VQVAECollater():
 
         wav_lengths = torch.LongTensor(len(batch))
         text_lengths = torch.LongTensor(len(batch))
+        langs = torch.LongTensor(len(batch))
 
         wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
         text_padded = torch.LongTensor(len(batch), max_text_len)
@@ -107,11 +150,15 @@ class VQVAECollater():
             text_padded[i, :text.size(0)] = text
             text_lengths[i] = text.size(0)
 
+            lang = row[2]
+            langs[i] = lang
+        wav_padded = wav_padded.squeeze(1)
         return {
-            'wav': wav_padded.squeeze(1),
+            'wav': wav_padded,
             'wav_lengths':wav_lengths,
             'text':text_padded,
-            'text_lengths':text_lengths
+            'text_lengths':text_lengths,
+            'langs':langs
         }
 
 class BucketSampler(torch.utils.data.Sampler):

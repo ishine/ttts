@@ -3,10 +3,16 @@ from pypinyin import pinyin, lazy_pinyin, Style
 import os
 import glob
 import cutlet
+from hangul_romanize import Transliter
+from hangul_romanize.rule import academic
 katsu = cutlet.Cutlet()
+r = Transliter(academic)
 
 # 设置包含子文件夹和.lab文件的目录路径
-base_dir = 'ttts/datasets/韩语 - Korean'
+base_dir = 'ttts/datasets/genshin/中文 - Chinese'
+# base_dir = 'ttts/datasets/genshin/日语 - Japanese'
+# base_dir = 'ttts/datasets/genshin/韩语 - Korean'
+# base_dir = 'ttts/datasets/genshin/英语 - English'
 
 # 用于存储所有.lab文件内容的列表
 all_lab_contents = []
@@ -21,5 +27,6 @@ for lab_file in glob.glob(os.path.join(base_dir, '**', '*.lab'), recursive=True)
 with open('ttts/data/bpe_train-set.txt', 'w', encoding='utf-8') as combined_file:
     for content in all_lab_contents:
         # content = katsu.romaji(content)
-        # content = ' '.join(lazy_pinyin(content, style=Style.TONE3, neutral_tone_with_five=True))
+        content = ' '.join(lazy_pinyin(content, style=Style.TONE3, neutral_tone_with_five=True))
+        # content = r.translit(content)
         combined_file.write(content + '\n')  # 每个文件内容后添加换行符

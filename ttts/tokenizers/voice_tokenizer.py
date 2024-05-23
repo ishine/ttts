@@ -60,7 +60,7 @@ def train(save_path):
     #bcd = datasets.load_dataset('bookcorpus', cache_dir='Z:\\huggingface_datasets\\cache')['train']
 
     #allowed_characters_re = re.compile(r'^[0-9a-z!@#%_=:;"/, \-\$\^&\*\(\)\+\{\[\]\}\\\.\'\?—–ʼ]+$')
-    allowed_characters_re = re.compile(r'^[\u3131-\uD79D0-9a-z!:~;."/, \-\(\)\.\'\?ʼ，。？：；’‘”“、！…（）」「《》]+$')
+    allowed_characters_re = re.compile(r'^[0-9a-z!:~;."/, \-\(\)\.\'\?ʼ，。？：；’‘”“、！…（）」「《》]+$')
     def preprocess_word(word, report=False):
         # word = english_cleaners(word)
         word = remove_extraneous_punctuation(word.lower())
@@ -92,7 +92,7 @@ def test(tok_path):
     with open('ttts/data/bpe_train-set.txt', 'r', encoding='utf-8') as at:
         ttsd = at.readlines()
         for line in ttsd:
-            line = line.strip()
+            line = line.strip().lower()
             seq = tok.encode(line)
             out = tok.decode(seq)
             print(f">>>{line}")
@@ -102,5 +102,9 @@ def test(tok_path):
 if __name__ == '__main__':
     # train('ttts/tokenizers/jp_tokenizer.json')
     # test('ttts/tokenizers/jp_tokenizer.json')
-    train('ttts/tokenizers/kr_tokenizer.json')
-    test('ttts/tokenizers/kr_tokenizer.json')
+    # train('ttts/tokenizers/kr_tokenizer.json')
+    # test('ttts/tokenizers/kr_tokenizer.json')
+    train('ttts/tokenizers/zh_tokenizer.json')
+    test('ttts/tokenizers/zh_tokenizer.json')
+    # train('ttts/tokenizers/en_tokenizer.json')
+    # test('ttts/tokenizers/en_tokenizer.json')
