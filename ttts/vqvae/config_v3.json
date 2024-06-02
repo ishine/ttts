@@ -26,7 +26,7 @@
     "path":"ttts/datasets/genshin_data_latin.jsonl",
     "pad_to_samples":200,
     "should_squeeze": true,
-    "lang": "ZH"
+    "lang": "EN,ZH,JP,KR"
   },
   "dataloader":
   {
@@ -49,9 +49,9 @@
     "cleaned_text": true
   },
   "vqvae": {
-    "inter_channels": 192,
-    "hidden_channels": 192,
-    "filter_channels": 768,
+    "inter_channels": 128,
+    "hidden_channels": 128,
+    "filter_channels": 512,
     "n_heads": 2,
     "n_layers": 3,
     "kernel_size": 3,

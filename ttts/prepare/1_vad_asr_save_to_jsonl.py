@@ -24,16 +24,16 @@ if __name__ == '__main__':
     # phase 1
     from ttts.prepare.vad_process import process_file_vad
     print("---------------phase1-----------------")
-    files = get_paths_with_cache('ttts/datasets/44k_dataset')
-    out_path = 'ttts/datasets/44k_dataset_clips'
+    files = get_paths_with_cache('ttts/datasets/raw_datasets')
+    out_path = 'ttts/datasets/dataset_clips_v4'
     Path(out_path).mkdir(exist_ok = True, parents=True)
     phase1_vad_and_sample(files, out_path, 8)
 
     # phase 2 
     from ttts.prepare.asr_process import process_file_asr
     print("---------------phase2-----------------")
-    files = get_paths_with_cache('ttts/datasets/44k_dataset_clips')
-    out_path = 'ttts/datasets/44k_data.jsonl'
+    files = get_paths_with_cache('ttts/datasets/dataset_clips_v4')
+    out_path = 'ttts/datasets/data_v4.jsonl'
     phase2_filter_and_transcript_and_to_jsonl(files, out_path, 8)
 
 

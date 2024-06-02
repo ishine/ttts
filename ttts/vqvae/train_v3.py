@@ -97,12 +97,12 @@ class Trainer(object):
         collate_fn=VQVAECollater()
         self.dataloader = DataLoader(
             dataset,
-            batch_size=hps.train.batch_size,
+            # batch_size=hps.train.batch_size,
             num_workers=hps.dataloader.num_workers,
             shuffle=False,
             pin_memory=True,
             collate_fn=collate_fn,
-            # batch_sampler=train_sampler,
+            batch_sampler=train_sampler,
             persistent_workers=True,
             prefetch_factor=16,)
         self.train_steps = self.cfg['train']['train_steps']
@@ -198,9 +198,9 @@ class Trainer(object):
                     spec_length = torch.LongTensor([
                         x//self.hps.data.hop_length for x in wav_length]).to(device)
                     with self.accelerator.autocast():
-                        (y_hat, ids_slice, l_length, l_detail, l_text_detail, l_dur_detail, z_mask,
+                        (y_hat, ids_slice, l_length, l_detail, l_dur_detail, z_mask,
                             (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),
-                            stats_ssl,) = self.G(spec, spec_length, text, text_length, prosody)
+                            latent,) = self.G(spec, spec_length, text, text_length)
                         #  ssl, y, y_lengths, text, text_length
                         mel = spec_to_mel_torch(
                             spec,
@@ -252,7 +252,6 @@ class Trainer(object):
                     with self.accelerator.autocast():
                         y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.D(y, y_hat)
                     loss_detail = l_detail
-                    loss_text_detail = l_text_detail
                     loss_dur_detail = l_dur_detail
                     loss_dur = torch.sum(l_length.float())
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * 45
@@ -262,7 +261,7 @@ class Trainer(object):
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
                     loss_gen_all = loss_gen + loss_fm + loss_mel \
                         + loss_kl + loss_kl_text + loss_dur \
-                        + loss_detail + loss_text_detail + loss_dur_detail
+                        + loss_detail + loss_dur_detail
 
                     self.G_optimizer.zero_grad()
                     self.accelerator.backward(loss_gen_all)
@@ -287,7 +286,6 @@ class Trainer(object):
                                 'gen/loss_mel':loss_mel,
                                 'gen/loss_dur':loss_dur,
                                 'gen/loss_detail':loss_detail, 
-                                'gen/loss_text_detail':loss_text_detail,
                                 'gen/loss_dur_detail':loss_dur_detail,
                                 'gen/loss_kl':loss_kl, 
                                 'gen/loss_kl_text':loss_kl_text,
@@ -299,8 +297,8 @@ class Trainer(object):
                         image_dict = {
                             "img/mel": plot_spectrogram_to_numpy(y_mel[0, :, :].detach().unsqueeze(-1).cpu().numpy()),
                             "img/mel_pred": plot_spectrogram_to_numpy(y_hat_mel[0, :, :].detach().unsqueeze(-1).cpu().numpy()),
-                            "img/mel_raw": plot_spectrogram_to_numpy( mel[0].data.cpu().numpy()),
-                            "img/stats_ssl": plot_spectrogram_to_numpy(stats_ssl[0].data.cpu().numpy()),
+                            "img/mel_raw": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
+                            "img/latent": plot_spectrogram_to_numpy(latent[0].data.cpu().numpy()),
                         }
                         audios_dict = {
                             'wav/gt':wav[0].detach().cpu(),
@@ -331,5 +329,5 @@ class Trainer(object):
 
 if __name__ == '__main__':
     trainer = Trainer(cfg_path='ttts/vqvae/config_v3.json')
-    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-23-08-45-13/model-30.pt')
+    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-31-16-58-34/model-555.pt')
     trainer.train()

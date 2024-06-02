@@ -57,7 +57,7 @@ class VQGANDataset(torch.utils.data.Dataset):
         for path,text,lang,latin,wav_length,sr in zip(
             self.paths,self.texts,self.langs,self.latins,wav_lengths,srs):
             duration = wav_length/sr
-            if duration < 10 and duration > 1 and lang==hps.dataset.lang:
+            if duration < 10 and duration > 1 and lang in hps.dataset.lang:
                 filtered_paths.append(path)
                 lengths.append(duration*16000//self.hop_length)
                 filtered_texts.append(text)
@@ -72,6 +72,7 @@ class VQGANDataset(torch.utils.data.Dataset):
         self.langs = filtered_langs
         self.latins = filtered_latins
         self.lengths = lengths
+        print("dataset size: ",len(lengths))
 
     def __getitem__(self, index):
         text = self.latins[index]

@@ -195,16 +195,25 @@ class SpecEncoder(nn.Module):
         if self.sample==True:
             self.proj = nn.Conv1d(out_channels, out_channels * 2, 1)
 
-    def forward(self, y, y_lengths, g=None):
+    def forward(self, y, y_lengths, g=None, refer=None, refer_lengths=None):
         y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(
             y.dtype
         )
         if g is not None:
             y = y + self.ge_proj(g.squeeze(-1)).unsqueeze(-1)
-        y = self.encoder(y * y_mask, y_mask)
+        if refer is not None:
+            y_mask2 = torch.unsqueeze(commons.sequence_mask(y_lengths+refer_lengths, y.size(2)+refer.shape[2]), 1).to(
+                y.dtype
+            )
+            T = y.shape[-1]
+            y = torch.cat([y,refer],dim=2)
+            y = self.encoder(y * y_mask2, y_mask2)
+            y = y[:,:,:T]
+        else:
+            y = self.encoder(y * y_mask, y_mask)
         y = self.out_proj(y)
         if self.sample==False:
-            return y
+            return y*y_mask
 
         stats = self.proj(y) * y_mask
         m, logs = torch.split(stats, self.out_channels, dim=1)
@@ -644,6 +653,10 @@ class DurationPredictor(nn.Module):
             in_channels, filter_channels, kernel_size, padding=kernel_size // 2
         )
         self.norm_1 = modules.LayerNorm(filter_channels)
+        self.enc = attentions.Encoder(
+            filter_channels, filter_channels, 2,
+            4, kernel_size, p_dropout
+        )
         self.conv_2 = nn.Conv1d(
             filter_channels, filter_channels, kernel_size, padding=kernel_size // 2
         )
@@ -664,6 +677,7 @@ class DurationPredictor(nn.Module):
         x = torch.relu(x)
         x = self.norm_1(x)
         x = self.drop(x)
+        x = self.enc(x * x_mask, x_mask)
         x = self.conv_2(x * x_mask)
         x = torch.relu(x)
         x = self.norm_2(x)
@@ -747,38 +761,36 @@ class SynthesizerTrn(nn.Module):
             filter_channels,
             False,
             n_heads,
-            6,
+            4,
             kernel_size,
             p_dropout,
             latent_channels=192,
             gin_channels = gin_channels,
         )
-        # self.text_detail_enc = SpecEncoder(
-        #     inter_channels,
-        #     hidden_channels,
-        #     filter_channels,
-        #     False,
-        #     n_heads,
-        #     4,
-        #     kernel_size,
-        #     p_dropout,
-        #     latent_channels=192,
-        # )
+        self.refer_feature_enc = SpecEncoder(
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            False,
+            n_heads,
+            4,
+            kernel_size,
+            p_dropout,
+            latent_channels=192,
+        )
 
         self.enc_p = []
         self.enc_p.extend(
             [
-                PosteriorEncoder(
-                    prosody_channels, inter_channels, hidden_channels, False,
-                5, 1, 16, gin_channels=gin_channels),
                 SpecEncoder(
                     inter_channels, hidden_channels, filter_channels, False, n_heads,
-                n_layers, kernel_size, p_dropout,gin_channels=gin_channels),
+                4, kernel_size, p_dropout,gin_channels=gin_channels),
                 SpecEncoder(
                     inter_channels, hidden_channels, filter_channels, True, n_heads,
-                n_layers, kernel_size, p_dropout,gin_channels=gin_channels),
+                6, kernel_size, p_dropout,gin_channels=gin_channels),
             ]
         )
+        self.spec_proj = nn.Conv1d(spec_channels, hidden_channels, 1)
         self.enc_p = nn.ModuleList(self.enc_p)
         self.enc_q = PosteriorEncoder(
             spec_channels, inter_channels, hidden_channels, True,
@@ -795,7 +807,7 @@ class SynthesizerTrn(nn.Module):
             filter_channels,
             False,
             n_heads,
-            6,
+            4,
             kernel_size,
             p_dropout,
             latent_channels=192,
@@ -830,7 +842,7 @@ class SynthesizerTrn(nn.Module):
                 .detach()
             )
         return attn
-    def forward(self, y, y_lengths, text, text_lengths, prosody):
+    def forward(self, y, y_lengths, text, text_lengths):
         y_mask = torch.unsqueeze(
             commons.sequence_mask(y_lengths, y.size(2)), 1).to(y.dtype)
         ge = self.ref_enc(y * y_mask, y_mask)
@@ -844,7 +856,6 @@ class SynthesizerTrn(nn.Module):
         x_mask = text_mask
         w = attn.sum(2)
 
-        l_text_detail = 0
         durs = w.squeeze(1).long()
         dur_detail = self.dur_detail_emb(durs).transpose(1,2)
         dur_detail_ = self.dur_detail_enc(text.detach(), text_lengths, g=ge)
@@ -862,14 +873,15 @@ class SynthesizerTrn(nn.Module):
         logs_t = torch.matmul(attn.squeeze(1), logs_t.transpose(1, 2)).transpose(1, 2)
         text =  torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1, 2)
 
-        x = self.enc_p[0](prosody, y_lengths, g=ge)
-        x = self.enc_p[1](x, y_lengths, g=ge)
-        detail = x
+        spec = self.spec_proj(y)*y_mask
+        detail = self.enc_p[0](spec, y_lengths, g=ge)
         detail_ = self.detail_enc(text, y_lengths, g=ge)
         l_detail = torch.sum(((detail - detail_) ** 2)*y_mask) / torch.sum(y_mask)
-        x = text + detail
-        x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
-        quantized = x
+        text = text + detail
+        refer_feature = self.refer_feature_enc(spec,y_lengths)
+        text, m_p, logs_p = self.enc_p[1](text,y_lengths,g=ge, refer=refer_feature,refer_lengths=y_lengths)
+
+        quantized = text
 
         z_slice, ids_slice = commons.rand_slice_segments(
             z, y_lengths, self.segment_size
@@ -880,7 +892,6 @@ class SynthesizerTrn(nn.Module):
             ids_slice,
             l_length,
             l_detail,
-            l_text_detail,
             l_dur_detail,
             y_mask,
             (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),
@@ -908,8 +919,10 @@ class SynthesizerTrn(nn.Module):
         text = torch.matmul(attn.squeeze(1), text.transpose(1, 2)).transpose(1,2)
 
         detail = self.detail_enc(text, y_lengths, g=ge)
-        x = detail + text
-        x, m_p, logs_p = self.enc_p[2](x,y_lengths,g=ge)
+        text = text + detail
+        spec = self.spec_proj(refer)*refer_mask
+        refer_feature = self.refer_feature_enc(spec,refer_lengths)
+        x, m_p, logs_p = self.enc_p[1](text, y_lengths, g=ge, refer=refer_feature,refer_lengths=refer_lengths)
 
         z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=ge, reverse=True)
